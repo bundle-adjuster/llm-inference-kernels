@@ -220,7 +220,7 @@ dependencies:
       - httpcore==1.0.9
       - httptools==0.7.1
       - httpx==0.28.1
-      - huggingface-hub==1.15.0
+      - huggingface-hub==0.36.2
       - idna==3.15
       - importlib-metadata==9.0.0
       - iniconfig==2.3.0
@@ -315,11 +315,11 @@ dependencies:
       - starlette==0.52.1
       - sympy==1.13.1
       - tiktoken==0.13.0
-      - tokenizers==0.22.2
+      - tokenizers==0.21.4
       - torch==2.5.1+cu124
       - torchvision==0.20.1+cu124
       - tqdm==4.67.3
-      - transformers==5.9.0
+      - transformers==4.47.1
       - triton==3.1.0
       - typer==0.25.1
       - typing-extensions==4.15.0

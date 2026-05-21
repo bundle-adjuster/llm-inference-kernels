@@ -12,8 +12,12 @@
 torch==2.5.1
 numpy
 
-# Target model + serving baselines
-transformers>=4.46
+# Target model + serving baselines.
+# transformers is pinned: vLLM 0.6.6 declares only `transformers>=4.45.2` (no
+# upper bound), so pip will happily install transformers 5.x — but vLLM 0.6.6
+# breaks against it (5.x rewrote the tokenizer backend). 4.47.1 is the release
+# vLLM 0.6.6 + torch 2.5.1 were built against; both baselines run on it.
+transformers==4.47.1
 accelerate
 vllm==0.6.6
 

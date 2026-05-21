@@ -17,13 +17,17 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 - [x] After install succeeds, lock it:
       `conda env export --no-builds > environment.lock.yml`
 - [x] Run `scripts/detect_env.sh` → `docs/results/env-report.md`
-- [ ] Download Llama 3 8B weights; confirm it loads in FP16 and generates text
-- [ ] Stand up vLLM; record baseline tokens/sec on the reference workload
+- [x] Download Llama 3.1 8B Instruct weights; confirms FP16 load + generation
+      (`scripts/load_llama.py`): 16.06 GB weights, 16.08 GB peak VRAM
+- [x] Stand up vLLM; record baseline tokens/sec on the reference workload
+      (`benchmarks/bench_e2e.py`): vLLM 703 tok/s, HF generate 355 tok/s
 - [~] Verify `benchmarks/harness.py` — timing path verified; allclose/memory with first kernel
 - [x] Lock the reference workload (batch, prompt len, gen len) in
       `docs/benchmarking-methodology.md`
-- [ ] Lock GPU clocks; document the measurement protocol
-- [ ] First commit of RESULTS.md with the vLLM + PyTorch baselines
+- [~] Lock GPU clocks; document the measurement protocol — `scripts/lock_clocks.sh`
+      ready + protocol documented; run `sudo bash scripts/lock_clocks.sh lock`
+      (needs root) before the Phase 1 microbenchmarks
+- [x] First commit of RESULTS.md with the vLLM + PyTorch baselines
 
 **Exit criterion:** baselines reproducible to <2% run-to-run; harness trusted.
 

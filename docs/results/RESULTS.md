@@ -8,15 +8,27 @@ guess. Commit hash makes every number reproducible.
 
 ## Environment
 
-See [`env-report.md`](env-report.md). Clocks locked: _TBD_. Reference workload:
-_TBD_ (defined in `../benchmarking-methodology.md`).
+See [`env-report.md`](env-report.md). RTX 4090 (sm_89), CUDA 12.4, torch
+2.5.1+cu124, transformers 4.47.1, vLLM 0.6.6, flash-attn 2.8.3. Clocks: default
+(boost) for the Phase 0 end-to-end baselines below — observed run-to-run
+variance < 0.2%; lock via `scripts/lock_clocks.sh` before the Phase 1
+microbenchmarks. Reference workload defined in
+[`../benchmarking-methodology.md`](../benchmarking-methodology.md).
 
 ## Baselines (Phase 0)
 
-| What | Workload | Number | Notes |
-|------|----------|--------|-------|
-| PyTorch eager (Llama 3 8B) | reference workload | _TBD_ tok/s | |
-| vanilla vLLM (Llama 3 8B) | reference workload | _TBD_ tok/s | the bar |
+Reference serving workload: Llama 3.1 8B Instruct FP16, batch 16, prompt 512,
+generate 512 — 8192 output tokens/run, greedy, EOS suppressed. Measured by
+`benchmarks/bench_e2e.py`: median of 3 timed runs after 1 warmup.
+
+| What | Latency (median) | Throughput | Peak VRAM | Notes |
+|------|------------------|------------|-----------|-------|
+| PyTorch (HF `generate`) | 23.10 s | 354.6 tok/s | 18.50 GB | sdpa attention; static batch, no continuous batching |
+| vanilla vLLM 0.6.6 | 11.65 s | 703.2 tok/s | n/a | the bar; paged KV + continuous batching + CUDA graphs; `max_model_len=1024` |
+
+vLLM delivers **1.98×** the HF `generate()` throughput on this workload. vLLM
+peak VRAM is not directly comparable — it reserves a fixed `gpu_memory_utilization`
+(0.9 × 24 GB) pool up front by design.
 
 ## Track 1 — Fused attention
 
