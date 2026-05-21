@@ -64,17 +64,21 @@ roofline because Z."
 - Save raw reports under `docs/results/raw/` (git-ignored); commit the
   distilled numbers to `RESULTS.md`.
 
-## Reference workload (lock in Phase 0)
+## Reference workload (LOCKED 2026-05-21)
 
-Define once and reuse everywhere so all numbers are comparable:
+Defined once and reused everywhere so all numbers are comparable. Frozen for the
+project — changing any value invalidates previously recorded numbers.
 
-- Model: Llama 3 8B (Instruct), FP16 base.
-- Prompt length: _TBD_ tokens
-- Generation length: _TBD_ tokens
-- Batch size: _TBD_
-- Decode microbenchmarks: KV-cache length sweep _TBD_
-
-> Fill the TBDs in Phase 0 and treat them as frozen for the project.
+- **Model:** Llama 3.1 8B Instruct, FP16 base.
+- **End-to-end serving workload:**
+  - Batch size: **16**
+  - Prompt length: **512** tokens
+  - Generation length: **512** tokens
+  - Footprint: ~16 GB weights + ~4 GB KV cache — fits the 24 GB RTX 4090.
+- **Decode-attention microbenchmark:** batch **8**, KV-cache length sweep
+  ∈ **{512, 1024, 2048, 4096, 8192, 16384}**.
+- **Quantized-matmul microbenchmark:** real Llama 3.1 8B linear-layer shapes,
+  M ∈ **{1, 8, 32, 128, 512}** (crosses the memory- → compute-bound boundary).
 
 ## The incremental log
 

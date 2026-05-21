@@ -12,15 +12,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 - [x] Create the reproducible conda env: `conda env create -f environment.yml`
       (Python 3.11, CUDA 12.4 toolkit; target GPU RTX 4090 / sm_89)
-- [ ] Install flash-attn: `pip install flash-attn --no-build-isolation`
+- [x] Install flash-attn: `MAX_JOBS=8 pip install flash-attn==2.8.3 --no-build-isolation`
 - [x] Confirm `torch.cuda.is_available()` and the cu124 build inside the env
 - [x] After install succeeds, lock it:
       `conda env export --no-builds > environment.lock.yml`
 - [x] Run `scripts/detect_env.sh` → `docs/results/env-report.md`
 - [ ] Download Llama 3 8B weights; confirm it loads in FP16 and generates text
 - [ ] Stand up vLLM; record baseline tokens/sec on the reference workload
-- [ ] Verify `benchmarks/harness.py` (CUDA-event timing, allclose, peak memory)
-- [ ] Lock the reference workload (batch, prompt len, gen len) in
+- [~] Verify `benchmarks/harness.py` — timing path verified; allclose/memory with first kernel
+- [x] Lock the reference workload (batch, prompt len, gen len) in
       `docs/benchmarking-methodology.md`
 - [ ] Lock GPU clocks; document the measurement protocol
 - [ ] First commit of RESULTS.md with the vLLM + PyTorch baselines

@@ -30,5 +30,6 @@ pybind11
 pytest
 
 # flash-attn: install AFTER the env exists — it needs torch importable at build
-# time, so it is intentionally NOT in the auto-resolved list:
-#   pip install flash-attn --no-build-isolation
+# time, so it is intentionally NOT in the auto-resolved list. Installed with
+# MAX_JOBS capped to avoid OOM during the CUDA compile:
+#   MAX_JOBS=8 pip install flash-attn==2.8.3 --no-build-isolation

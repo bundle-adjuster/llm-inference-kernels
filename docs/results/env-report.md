@@ -1,6 +1,6 @@
 # Environment Report
 
-_Generated: 2026-05-21T03:46:02Z_
+_Generated: 2026-05-21T04:04:44Z_
 
 ## GPU
 ```
@@ -26,7 +26,7 @@ capability    sm_89
 FP8 tensor    yes (sm_89+)
 transformers  5.9.0
 vllm          0.6.6
-flash_attn    not installed
+flash_attn    2.8.3
 ```
 
 ## Notes

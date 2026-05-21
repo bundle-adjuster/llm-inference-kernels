@@ -206,6 +206,7 @@ dependencies:
       - einops==0.8.2
       - fastapi==0.136.1
       - filelock==3.29.0
+      - flash-attn==2.8.3
       - fonttools==4.63.0
       - frozenlist==1.8.0
       - fsspec==2026.2.0
