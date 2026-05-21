@@ -1,0 +1,34 @@
+# Python dependencies for llm-inference-kernels.
+#
+# The canonical environment spec is environment.yml (conda); this file is the
+# pip-only path and is referenced from environment.yml's pip section.
+# After a successful install, lock exact versions:
+#   pip freeze > requirements.lock.txt
+
+# PyTorch CUDA 12.4 wheels:
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Core
+torch==2.5.1
+numpy
+
+# Target model + serving baselines
+transformers>=4.46
+accelerate
+vllm==0.6.6
+
+# Evaluation (perplexity)
+datasets
+
+# Benchmarking / plotting
+pandas
+matplotlib
+
+# Build + test
+ninja
+pybind11
+pytest
+
+# flash-attn: install AFTER the env exists — it needs torch importable at build
+# time, so it is intentionally NOT in the auto-resolved list:
+#   pip install flash-attn --no-build-isolation

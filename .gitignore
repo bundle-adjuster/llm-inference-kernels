@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+dist/
+*.so
+*.o
+*.obj
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# CUDA / profiler dumps
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+docs/results/raw/
+
+# Models & data (large — never commit)
+models/
+weights/
+data/
+*.safetensors
+*.bin
+*.gguf
+
+# Environment
+.venv/
+venv/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
