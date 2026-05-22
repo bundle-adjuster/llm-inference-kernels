@@ -55,15 +55,25 @@ Final `O = O_acc / l`. Numerically stable, single pass, no `S` in HBM.
 
 ## Design — decode kernel v0 (naive, must be correct first)
 
-- Grid: one block per `(batch, head)`. Block: one warp or a few warps.
-- Load `Q` (`d` elements, here 128) into registers/shared memory.
-- Loop over the KV cache: per key, warp computes `dot(Q, K_j)`, applies
-  `1/sqrt(d)` and mask; accumulate online-softmax state; accumulate `O`.
-- Write `O` for this `(batch, head)`.
-- GQA: Llama 3 8B has 32 query heads, 8 KV heads — map query heads to the
-  shared KV head.
+One thread block per `(batch, head)`; a natural block size is `head_dim`
+(128) threads. Three phases, with the score vector held in dynamic shared
+memory — no online softmax yet (that is optimization 1 below).
 
-This v0 is intentionally simple — it is the **CUDA-vs-CUDA baseline**.
+1. **Scores.** For each cached key `j`, the block computes
+   `s[j] = scale · dot(q, k[b, kv(h), j, :])` — a `head_dim`-wide reduction
+   across the block — and stores `s[j]` in shared memory.
+2. **Softmax.** Block-reduce `max` over `s`, exponentiate `s[j] − max`,
+   block-reduce the sum.
+3. **Output.** `o[d] = (1/sum) · Σ_j exp(s[j] − max) · v[b, kv(h), j, d]`.
+
+Details: GQA maps a query head to its kv head via
+`kv(h) = h / (n_heads / n_kv_heads)` (`h / 4` for Llama 3 8B). Accumulate in
+fp32; inputs and outputs are fp16. The score buffer costs `seqlen_kv · 4`
+bytes — beyond the 48 KB static limit, opt in with
+`cudaFuncAttributeMaxDynamicSharedMemorySize` (Ada allows ~99 KB).
+
+v0 is intentionally slow — it is the **CUDA-vs-CUDA baseline** the roadmap
+below improves, one measured step at a time.
 
 ## Optimization roadmap (one commit + one RESULTS.md row each)
 
