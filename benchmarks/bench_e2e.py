@@ -46,6 +46,7 @@ def _prompt_token_ids() -> list[list[int]]:
 
 
 def _report(engine: str, detail: str, samples: list[float]) -> None:
+    """Print median latency / tokens/sec / VRAM block for one engine's run."""
     samples.sort()
     median = statistics.median(samples)
     tps = _TOTAL_OUT_TOKENS / median
@@ -127,6 +128,7 @@ def bench_vllm(runs: int) -> None:
 
 
 def main() -> None:
+    """CLI entry point: parse `--engine {torch,vllm}` and dispatch."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, choices=["torch", "vllm"])
     parser.add_argument("--runs", type=int, default=3,

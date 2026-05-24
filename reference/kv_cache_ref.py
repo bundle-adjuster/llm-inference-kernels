@@ -30,7 +30,15 @@ import torch
 
 
 def _qmax(bits: int) -> int:
-    """Symmetric integer-range upper bound: 2^(bits-1) − 1."""
+    """Symmetric integer-range upper bound: 2^(bits-1) − 1.
+
+    Args:
+        bits: 4 or 8.
+
+    Returns:
+        7 for 4-bit, 127 for 8-bit. Quantized values land in [-qmax, qmax]
+        (i.e. -127..127 or -7..7), never the asymmetric INT_MIN.
+    """
     assert bits in (4, 8), f"only int4/int8 supported, got bits={bits}"
     return (1 << (bits - 1)) - 1
 

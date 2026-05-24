@@ -21,6 +21,13 @@ from benchmarks.workload import MODEL_ID
 
 
 def main() -> None:
+    """Smoke-test Llama 3.1 8B Instruct: load fp16 weights and generate.
+
+    Confirms the gated HF model downloads and loads, the fp16 weights
+    fit in 24 GB VRAM with room for a short generation, and the
+    generate() path works. Prints load time, weight footprint, peak
+    VRAM, and a short generation sample so a human can eyeball coherence.
+    """
     if not torch.cuda.is_available():
         print("CUDA device required.")
         sys.exit(1)

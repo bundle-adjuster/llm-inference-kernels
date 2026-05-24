@@ -17,7 +17,13 @@ from harness import benchmark, check_close, achieved_bandwidth_gbps  # noqa: E40
 from reference.attention_ref import decode_attention, sdpa_attention  # noqa: E402
 
 
-def main():
+def main() -> None:
+    """Bench whichever decode-attention kernel is currently built.
+
+    Compares the custom kernel against PyTorch eager and PyTorch SDPA on
+    the locked microbench workload (Llama 3 8B head config, `batch=8,
+    seqlen_kv=4096`). Prints median latency + achieved KV bandwidth.
+    """
     if not torch.cuda.is_available():
         print("CUDA device required.")
         return

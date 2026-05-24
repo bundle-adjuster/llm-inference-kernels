@@ -26,6 +26,13 @@ from reference.kv_cache_ref import quantize_per_token, dequantize_per_token  # n
 
 
 def main() -> None:
+    """Bench fp16 / INT8 / INT4 KIVI KV-cache paths side by side.
+
+    Reports KV-cache memory, end-to-end attention latency, achieved KV
+    bandwidth, and the per-token quantize one-shot cost for each path.
+    Includes a kernel-level accuracy check (CUDA vs reference attention
+    on the same dequantized inputs) before timing.
+    """
     if not torch.cuda.is_available():
         print("CUDA device required.")
         return

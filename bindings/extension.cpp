@@ -8,6 +8,9 @@
 #include "kv_cache/kv_compress.cuh"
 
 
+// Fused decode attention with fp16 KV (current Phase 1 v3 kernel).
+// Inputs: q [b, n_heads, d], k/v [b, n_kv_heads, s, d], all fp16, contiguous.
+// Returns: out [b, n_heads, d] fp16. softmax_scale is typically 1/sqrt(d).
 torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
                                torch::Tensor v, double softmax_scale) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
@@ -70,6 +73,9 @@ quantize_per_token(torch::Tensor x) {
 }
 
 
+// Decode attention reading INT8-quantized KV with fused per-token dequant
+// (Phase 2b). k_q/v_q are int8; k_scale/v_scale are fp16, shape [b, n_kv, s].
+// Returns: out [b, n_heads, d] fp16.
 torch::Tensor decode_attention_int8(torch::Tensor q,
                                     torch::Tensor k_q, torch::Tensor k_scale,
                                     torch::Tensor v_q, torch::Tensor v_scale,
@@ -115,6 +121,9 @@ torch::Tensor decode_attention_int8(torch::Tensor q,
 }
 
 
+// KIVI K-side quantization: INT4 per-channel, groupwise along seqlen.
+// x: [b, n_kv, s, d] fp16. Returns (q [b, n_kv, s, d/2] int8 packed,
+// scale [b, n_kv, ceil(s/group_size), d] fp16). group_size = 32 in KIVI.
 std::tuple<torch::Tensor, torch::Tensor>
 quantize_k_per_channel_groupwise_int4(torch::Tensor x, int64_t group_size) {
     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
@@ -147,6 +156,9 @@ quantize_k_per_channel_groupwise_int4(torch::Tensor x, int64_t group_size) {
 }
 
 
+// KIVI V-side quantization: INT4 per-token, packed.
+// x: [b, n_kv, s, d] fp16. Returns (q [b, n_kv, s, d/2] int8 packed,
+// scale [b, n_kv, s] fp16) — one fp16 scale per token.
 std::tuple<torch::Tensor, torch::Tensor>
 quantize_v_per_token_int4(torch::Tensor x) {
     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
@@ -176,6 +188,11 @@ quantize_v_per_token_int4(torch::Tensor x) {
 }
 
 
+// Decode attention reading KIVI INT4 KV with fused per-channel-K +
+// per-token-V dequant (Phase 2c). k_q/v_q are packed int4 (one int8
+// byte = 2 nibbles); k_scale is [b, n_kv, n_groups, d] fp16; v_scale
+// is [b, n_kv, s] fp16. group_size must match what the quantize
+// kernel used (32 in KIVI). Returns: out [b, n_heads, d] fp16.
 torch::Tensor decode_attention_int4(torch::Tensor q,
                                     torch::Tensor k_q, torch::Tensor k_scale,
                                     torch::Tensor v_q, torch::Tensor v_scale,

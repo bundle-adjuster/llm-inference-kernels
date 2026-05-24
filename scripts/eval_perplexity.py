@@ -36,6 +36,7 @@ import math
 import os
 import sys
 import time
+from typing import Callable, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -57,8 +58,26 @@ _ORIGINAL_SDPA = F.scaled_dot_product_attention
 
 def _quantize_and_back(x: torch.Tensor, mode: str, *,
                        bits: int, group_size: int) -> torch.Tensor:
-    """Round-trip quantize → dequantize a [batch, n_heads, seqlen, head_dim]
-    K or V tensor in fp16. Returns the same shape + dtype as x."""
+    """Round-trip quantize → dequantize a K or V tensor.
+
+    Simulates "the cache was compressed in `mode`": the returned tensor
+    has the same shape and dtype as `x`, but its values are noisy in the
+    way the model would see them if the KV cache stored quantized bytes
+    and dequantized on the read side.
+
+    Args:
+        x: `[batch, n_heads, seqlen, head_dim]` (or any shape ending in
+            `head_dim`) — works for K and V identically.
+        mode: "per_token" (one scale per (batch, head, token), shared
+            across head_dim) or "per_channel_groupwise" (one scale per
+            (batch, head, group_of_tokens, head_dim_channel) — KIVI's K
+            recipe).
+        bits: 4 or 8.
+        group_size: tokens per group; only used in per_channel_groupwise.
+
+    Returns:
+        Same shape and dtype as `x`, values noisy per the chosen scheme.
+    """
     dtype = x.dtype
     if mode == "per_token":
         q, s = quantize_per_token(x.float(), bits=bits)
@@ -72,10 +91,23 @@ def _quantize_and_back(x: torch.Tensor, mode: str, *,
         raise ValueError(f"unknown mode {mode}")
 
 
-def make_patched_sdpa(mode: str, *, group_size: int = 32):
+SdpaFn = Callable[..., torch.Tensor]
+
+
+def make_patched_sdpa(mode: str, *, group_size: int = 32) -> SdpaFn:
     """Return a callable with the F.scaled_dot_product_attention signature
     that simulates `mode`'s KV-cache compression by quantizing+dequantizing
-    K and V before the underlying attention."""
+    K and V before the underlying attention.
+
+    Args:
+        mode: one of "fp16" (no patch — returns the original sdpa),
+            "int8", "int4-per-token", "int4-kivi".
+        group_size: tokens per group for the KIVI per-channel K path.
+
+    Returns:
+        A callable to bind to `F.scaled_dot_product_attention` via `_set_sdpa`.
+        Falls back to `_ORIGINAL_SDPA` for `mode == "fp16"`.
+    """
     if mode == "fp16":
         return _ORIGINAL_SDPA
 
@@ -98,7 +130,7 @@ def make_patched_sdpa(mode: str, *, group_size: int = 32):
     return patched
 
 
-def _set_sdpa(fn) -> None:
+def _set_sdpa(fn: SdpaFn) -> None:
     """Rebind F.scaled_dot_product_attention everywhere it's looked up at
     call time. Both `F.…` and `torch.nn.functional.…` point at the same
     module object, so assigning to either is sufficient — we do both for
@@ -107,7 +139,22 @@ def _set_sdpa(fn) -> None:
     torch.nn.functional.scaled_dot_product_attention = fn
 
 
-def evaluate_perplexity(model, chunks, label: str) -> float:
+def evaluate_perplexity(
+    model: torch.nn.Module,
+    chunks: List[torch.Tensor],
+    label: str,
+) -> float:
+    """Forward each chunk once, sum the cross-entropy loss, return perplexity.
+
+    Args:
+        model: causal LM in eval mode on CUDA.
+        chunks: list of 1-D `[chunk_size]` int64 token tensors on CPU; each
+            chunk is `.unsqueeze(0).cuda()`d into a `[1, chunk_size]` batch.
+        label: printed alongside the result; should describe the patch state.
+
+    Returns:
+        Average perplexity across all chunks, weighted by token count.
+    """
     model.eval()
     total_loss = 0.0
     total_tokens = 0
