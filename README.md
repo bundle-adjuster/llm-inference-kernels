@@ -92,6 +92,13 @@ cmake -B build -S . && cmake --build build
 python benchmarks/bench_attention.py
 ```
 
+**For a complete walkthrough** — what to run for each phase, what numbers
+to expect, what to look for in each kernel — see
+[`docs/running-the-repo.md`](docs/running-the-repo.md). It covers the
+`v0`–`v5` Phase 1 attention branches, the `2a`–`2d` Phase 2 KV-cache
+branches, expected headline numbers per branch, and the common gotchas
+(rebuild after checkout, conda activation, etc.).
+
 ## Status
 
 See [`TODO.md`](TODO.md) for the phased, step-by-step plan.
