@@ -49,9 +49,9 @@ def main():
     import llmik_cuda
     ref = decode_attention(q.unsqueeze(2), k, v, scale=scale).squeeze(2)
     out = llmik_cuda.decode_attention(q, k, v, scale)
-    check_close(out, ref, name="custom decode kernel v0")
+    check_close(out, ref, name="custom decode kernel")
     res = benchmark(lambda: llmik_cuda.decode_attention(q, k, v, scale),
-                    name="custom decode kernel v0")
+                    name="custom decode kernel")
     print(res)
     kv_bytes = 2 * k.numel() * k.element_size()  # K + V read once
     print(f"  achieved KV bandwidth: "
