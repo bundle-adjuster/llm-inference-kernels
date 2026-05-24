@@ -41,17 +41,21 @@ def main():
     print(benchmark(lambda: decode_attention(q.unsqueeze(2), k, v, scale=scale),
                     name="pytorch eager (decode)"))
 
-    # --- custom kernel: uncomment once built (Phase 1b) ---
-    # import llmik_cuda
-    # ref = decode_attention(q.unsqueeze(2), k, v, scale=scale).squeeze(2)
-    # out = llmik_cuda.decode_attention(q, k, v, scale)
-    # check_close(out, ref, name="custom decode kernel")
-    # res = benchmark(lambda: llmik_cuda.decode_attention(q, k, v, scale),
-    #                 name="custom decode kernel")
-    # print(res)
-    # kv_bytes = 2 * k.numel() * k.element_size()  # K + V read once
-    # print(f"  achieved KV bandwidth: "
-    #       f"{achieved_bandwidth_gbps(kv_bytes, res.median_ms):.0f} GB/s")
+    # --- baseline: PyTorch SDPA (FlashAttention / cuDNN) ---
+    print(benchmark(lambda: sdpa_attention(q.unsqueeze(2), k, v),
+                    name="pytorch sdpa (decode)"))
+
+    # --- custom kernel (v0) ---
+    import llmik_cuda
+    ref = decode_attention(q.unsqueeze(2), k, v, scale=scale).squeeze(2)
+    out = llmik_cuda.decode_attention(q, k, v, scale)
+    check_close(out, ref, name="custom decode kernel v0")
+    res = benchmark(lambda: llmik_cuda.decode_attention(q, k, v, scale),
+                    name="custom decode kernel v0")
+    print(res)
+    kv_bytes = 2 * k.numel() * k.element_size()  # K + V read once
+    print(f"  achieved KV bandwidth: "
+          f"{achieved_bandwidth_gbps(kv_bytes, res.median_ms):.0f} GB/s")
 
 
 if __name__ == "__main__":

@@ -32,14 +32,25 @@ peak VRAM is not directly comparable — it reserves a fixed `gpu_memory_utiliza
 
 ## Track 1 — Fused attention
 
+Microbench workload: Llama 3 8B head config (`n_heads=32, n_kv_heads=8,
+head_dim=128`), `batch=8, seqlen_kv=4096`, fp16. Measured by
+`benchmarks/bench_attention.py` (CUDA events, 25 warmup + 100 timed).
+Achieved BW = `(|K|+|V|) / median_latency`; each tensor is 64 MB so 128 MB
+streamed per call. For reference on this workload: PyTorch eager 3.77 ms,
+PyTorch SDPA 1.36 ms. Clocks not yet locked (TODO before `ncu` runs).
+
 | Step | Commit | Latency | Achieved BW | Speedup vs prev | Cause (ncu metric) |
 |------|--------|---------|-------------|-----------------|--------------------|
-| Naive CUDA decode kernel | _TBD_ | _TBD_ | _TBD_ | — (baseline) | — |
+| v0 naive (two-pass softmax) | _HEAD_ | 1.669 ms | 80 GB/s | — (baseline) | per-`j` block reductions in phase 1 serialize compute; KV is read in two passes (K in phase 1, V in phase 3); GQA reads not de-duplicated across query heads sharing a kv head. ncu profile pending (lock clocks first). |
 | + online softmax | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + warp reductions | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + vectorized loads | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + split-K (FlashDecoding) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + cp.async double-buffer | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+
+Correctness: v0 max |abs diff| vs fp32 reference = 6.1e-5 (well under the
+2e-2 gate). `tests/test_attention.py` green at batch ∈ {1, 8} ×
+seqlen_kv ∈ {128, 2048}.
 
 **vs SOTA:** `flash_attn` decode = _TBD_ µs. Gap = _TBD_%. Explanation: _TBD_.
 
