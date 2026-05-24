@@ -77,15 +77,21 @@ remains pending.
 
 ## Phase 2 — KV-cache compression  (design doc: `docs/02-kv-cache-compression.md`)
 
-- [ ] Reference: INT8/INT4 quantize + dequantize in PyTorch; perplexity harness
-- [ ] CUDA quantize kernel (called on KV-cache append)
-- [ ] Fuse dequant into the Phase 1 attention kernel (read INT8 KV directly)
-- [ ] `tests/test_kv_cache.py`: correctness + accuracy (perplexity delta)
-- [ ] INT4 path: per-channel K scales, per-token V scales (KIVI-style)
-- [ ] Measure: memory reduction, perplexity delta, decode tokens/sec
-- [ ] RESULTS.md entries; findings in `docs/02`
+Current state on `main`: **INT8 KV essentially lossless (Δppl +0.0008,
+0.51× memory, tied latency); INT4 KIVI clears the < 0.5 target (Δppl
++0.196, 0.27× memory, 1.29× faster than v3).** Both threshold AND target
+hit. Full Findings in [`docs/02-kv-cache-compression.md`](docs/02-kv-cache-compression.md).
 
-**Exit criterion:** Track 2 *Threshold* met (Target if time allows).
+- [x] Reference: INT8/INT4 quantize + dequantize in PyTorch (`reference/kv_cache_ref.py`); perplexity harness (`scripts/eval_perplexity.py`)
+- [x] CUDA quantize kernels: INT8 per-token, INT4 K per-channel groupwise, INT4 V per-token, all packed (`kernels/kv_cache/kv_compress.cu`)
+- [x] Fuse dequant into the Phase 1 attention kernel: INT8 reads (`kernels/attention/fused_attention_int8.cu`), INT4 KIVI reads (`kernels/attention/fused_attention_int4.cu`); both built on v3, both pass correctness
+- [x] `tests/test_kv_cache.py`: 38 tests covering reference round-trip + CUDA-vs-reference for all 5 paths
+- [x] INT4 path: per-channel K scales (group_size=32), per-token V scales (KIVI-style)
+- [x] Measure: memory reduction (`benchmarks/bench_kv_cache.py`), perplexity delta (`scripts/eval_perplexity.py`); decode tokens/sec deferred to Phase 4 (requires plumbing INT4 attention into Llama's actual decode loop)
+- [x] RESULTS.md entries; findings in `docs/02`
+
+**Exit criterion:** Track 2 *Threshold* AND *Target* met (Δppl < 0.2 for
+INT8 ✓ 0.0008; Δppl < 0.5 for INT4 KIVI ✓ 0.196).
 
 ---
 

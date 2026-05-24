@@ -168,6 +168,46 @@ V_q loads, the inner loop's instruction throughput is meaningfully higher.
 The dependency-chain-bound diagnosis from 2b still applies, but the chain
 itself got lighter in 2c.
 
-**Phase 2d — perplexity / decode tok/s: pending.** The headline question
-is whether the 42% kernel-level mean rel err translates to a perplexity
-delta within KIVI's threshold (≤ 0.5).
+**Phase 2d — perplexity (landed):**
+
+Measured on Llama 3.1 8B Instruct over the WikiText-2 test split (131,008
+tokens, 64 chunks × 2048 tokens) by `scripts/eval_perplexity.py`. The
+script patches `F.scaled_dot_product_attention` to round-trip K and V
+through the PyTorch quantization reference before delegating to the
+underlying sdpa — the model sees exactly the noisy K, V it would receive
+from a compressed KV cache at decode time.
+
+| Mode                       | ppl    | Δppl    | % delta | Target  | Verdict |
+|----------------------------|-------:|--------:|--------:|--------:|---------|
+| fp16 (baseline)            | 7.055  | —       | —       | —       | —       |
+| INT8 per-token K, V        | 7.056  | +0.0008 | +0.01%  | < 0.2   | **PASS** |
+| INT4 per-token K, V (naive)| 7.517  | +0.462  | +6.54%  | —       | KIVI comparator |
+| **INT4 KIVI** (per-ch K, per-token V) | **7.252** | **+0.196** | **+2.78%** | **< 0.5** | **PASS** |
+
+**Headline results:**
+
+- **INT8 KV is essentially lossless** (Δppl = +0.0008, well under the
+  0.2 threshold). Combined with 0.51× memory and tied latency vs v3,
+  INT8 is a no-brainer drop-in.
+- **INT4 KIVI clears the < 0.5 target with margin** (Δppl = +0.196).
+  At 0.27× memory AND 1.29× latency over v3, this is the headline win
+  of Phase 2.
+- **KIVI's per-channel K is worth 2.36× in quality at the same bit
+  depth** vs naive per-token K (0.196 vs 0.462). The K-side outliers
+  matter; the design doc's "K has persistent per-channel outliers; V
+  does not" prediction held experimentally.
+
+**Why the kernel-level 42% mean rel err didn't tank perplexity:** that
+number was measured on i.i.d. random gaussian inputs — uniformly hard
+for symmetric per-token quantization. Real activations have structure
+(per-channel outliers in K captured by KIVI's per-channel scales; V
+distribution narrower than worst case). The softmax's max-subtraction
+also makes the attention output relatively robust to per-element noise
+in V — only the ranking of large scores survives.
+
+**Not measured:** decode tokens/sec at the model level. That requires
+threading our `decode_attention_int4` CUDA kernel into Llama's actual
+KV-cache decode loop — Phase 4 integration work. The kernel-level
+benchmark (`benchmarks/bench_kv_cache.py`) shows the steady-state
+attention call is 1.29× faster with INT4 KV than fp16 KV, which is
+the direct decode-step speedup.
