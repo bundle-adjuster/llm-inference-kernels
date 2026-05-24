@@ -99,115 +99,48 @@ time allows.
 
 ## Findings
 
-**Phase 2b — INT8 per-token KV (landed):**
+The full narrative — theory, design choice, measured result, and lesson
+learned for each sub-step (2a reference → 2b INT8 → 2c INT4 KIVI →
+2d perplexity), including the three surprises that overturned a
+prediction one step earlier — lives in
+[`02-kv-cache-compression-journey.md`](02-kv-cache-compression-journey.md).
+The per-step table lives in [`results/RESULTS.md`](results/RESULTS.md).
 
-- **Memory: 0.51× of fp16** (128 MiB → 65 MiB on the reference workload;
-  63 MiB saved). Scale overhead is ~1.5% — one fp16 scale per token,
-  shared across head_dim.
-- **Kernel latency: 0.713 ms, tied with v3 fp16 (0.713 ms).** Halving KV
-  bytes did not move latency — we measured the INT8 kernel at 96 GB/s
-  effective KV bandwidth vs v3's 189 GB/s, both well under HBM peak
-  (1008 GB/s). The decode kernel is **dependency-chain-bound**, not
-  bandwidth-bound: the per-`j` `warp_reduce_sum → softmax → FMA` critical
-  path is the limiter, and that shape is the same in both kernels.
-  Consistent with Phase 1's v4/v5 results (more SMs and more cp.async
-  pipelining also didn't help — bandwidth wasn't the ceiling on this
-  workload).
-- **Accuracy: max |diff| vs fp16 reference 1.1e-3, mean relative error
-  2.5%.** Below the per-element quantization-noise floor of `1/127 ≈
-  0.78%` per element, propagated through the softmax.
-- **Quantize-kernel one-shot cost: 0.124 ms** for the full K cache (64 MiB
-  fp16 → 32 MiB int8 + scales). In serving this is amortised: only the
-  newly appended token is quantized per decode step.
-- **Implementation notes:** scale-folding optimisation — instead of
-  per-lane dequant (4 multiplies/thread/iter to materialise k = k_int ·
-  k_scale), compute the partial dot on int values and multiply by
-  `k_scale` once after `warp_reduce_sum` (linearity); fold `v_scale` into
-  the FMA coefficient `p_j_scaled = p_j · v_scale`. Saves 8 multiplies
-  per iter vs naive dequant-everything. INT8 loaded as `LDG.E.32` (4 bytes
-  per thread vs v3's 8) — `head_dim/32 = 4` lanes fits cleanly into one
-  int32 load.
+**Headline state on `main`:** both threshold AND target met.
 
-**Implication for Phase 2's framing:** the value of INT8 KV here is *memory*,
-not latency. Same answer time + half the cache → ~2× longer context or
-~2× larger batch in the same VRAM budget. The latency story may change
-in Phase 2c (INT4): four-bit loads can use `LDG.E.16` patterns and may
-expose different bottlenecks, but the dependency-chain analysis above
-predicts a latency tie there too.
+| Mode                                       | Memory       | Latency vs v3 | Δppl WikiText-2 | Target | Verdict |
+|--------------------------------------------|-------------:|--------------:|----------------:|-------:|---------|
+| **INT8 per-token K, V**                    | 65 MiB · 0.51× | tied (0.71 ms) | +0.0008         | < 0.2  | **PASS** |
+| **INT4 KIVI** (per-channel K, per-token V) | **34.5 MiB · 0.27×** | **1.29× faster (0.554 ms)** | **+0.196** | **< 0.5** | **PASS** |
 
-**Phase 2c — INT4 KIVI (landed):**
+INT8 is essentially lossless. INT4 KIVI is the headline — smaller AND
+faster AND within the quality budget. At the same INT4 bit depth, per-channel K
+is **2.36× better in Δppl than naive per-token K** (0.196 vs 0.462) — direct
+experimental confirmation that K's persistent outliers need their own scales.
 
-- **Memory: 0.27× of fp16** (128 MiB → 34.5 MiB on the reference workload;
-  93.5 MiB saved). K storage is `head_dim/2` packed bytes per token + a small
-  per-channel-per-group scales table; V storage is `head_dim/2` packed bytes
-  per token + one fp16 per-token scale.
-- **Kernel latency: 0.554 ms — 1.29× faster than v3 (0.715 ms).** INT4
-  *moves the needle* where INT8 didn't. The structural change: K scales
-  load **once per group** (every 32 inner iters), held in registers
-  through the group's inner loop, and pre-folded into q via
-  `q_scaled[d] = q[d] · k_scale[g, d]` at each group boundary. The inner
-  loop is then 4 multiplies on int values + warp_reduce + softmax + 4
-  FMAs on int values — denser than INT8's per-iter K scale load on top
-  of the dot product. Inner-loop K_q and V_q loads are also smaller
-  (`LDG.E.16`, 2 B/thread, one uint16 unpacked to 4 nibbles).
-- **Accuracy on random gaussians: max abs diff vs fp16 reference 2.3e-2,
-  mean rel err 42%.** Below INT4's per-element noise floor (`1/7 ≈ 14%`)
-  amplified through the softmax. This is the kernel-level number on
-  worst-case (random) data; perplexity on real LLM activations is the
-  Phase 2d question, and the KIVI paper's result suggests the per-channel
-  K helps a lot there because K's persistent outliers get their own scales.
-- **Quantize one-shot costs:** K (per-channel groupwise) 0.07 ms; V
-  (per-token packed) 0.12 ms. In serving these amortise to per-appended-
-  token costs.
+Key lessons from this phase (each tied to a sub-step in the journey doc):
 
-**Why INT4 moves latency where INT8 tied** (the surprise vs the Phase 2b
-diagnosis): INT8 still loaded one fp16 K scale *per j*, which the
-dependency chain couldn't hide. INT4 KIVI loads K scales once per 32 j's,
-so the per-iter load count drops by ~one. Combined with the smaller K_q +
-V_q loads, the inner loop's instruction throughput is meaningfully higher.
-The dependency-chain-bound diagnosis from 2b still applies, but the chain
-itself got lighter in 2c.
+1. **"Memory-bound" is a workload property, not a kernel property** —
+   INT8 halved KV bytes and tied latency with v3. On this workload the
+   decode kernel was nowhere near HBM peak; the per-`j` dependency
+   chain was the ceiling. Same lesson as Phase 1's v4 and v5.
+2. **Scale loop nesting decides whether quantization speeds up the
+   kernel** — INT8 loaded a scale per `j` and tied; INT4 KIVI loads
+   scales per *group* and beats v3 by 1.29×. Moving the load out of
+   the inner loop is the structural win, not the byte count.
+3. **Per-channel quantization at 4 bits is friendlier to the kernel
+   than per-token at 8 bits** — counter-intuitive but right, because
+   per-channel scales fold cleanly into a once-per-group pre-scale of q.
+4. **Kernel-level i.i.d. error is a worst-case smoke test, not a model
+   quality verdict** — INT4 KIVI's 42% mean rel err on random gaussians
+   shrank to a 2.78% Δppl on real activations. Real LLM activations
+   have structure; softmax max-subtraction is forgiving.
+5. **The KIVI insight is two-for-one** — per-channel K is the *quality*
+   win (Δppl) and per-group K scale loads are the *latency* win
+   (1.29× over v3). The same structural trick attacks both axes.
 
-**Phase 2d — perplexity (landed):**
-
-Measured on Llama 3.1 8B Instruct over the WikiText-2 test split (131,008
-tokens, 64 chunks × 2048 tokens) by `scripts/eval_perplexity.py`. The
-script patches `F.scaled_dot_product_attention` to round-trip K and V
-through the PyTorch quantization reference before delegating to the
-underlying sdpa — the model sees exactly the noisy K, V it would receive
-from a compressed KV cache at decode time.
-
-| Mode                       | ppl    | Δppl    | % delta | Target  | Verdict |
-|----------------------------|-------:|--------:|--------:|--------:|---------|
-| fp16 (baseline)            | 7.055  | —       | —       | —       | —       |
-| INT8 per-token K, V        | 7.056  | +0.0008 | +0.01%  | < 0.2   | **PASS** |
-| INT4 per-token K, V (naive)| 7.517  | +0.462  | +6.54%  | —       | KIVI comparator |
-| **INT4 KIVI** (per-ch K, per-token V) | **7.252** | **+0.196** | **+2.78%** | **< 0.5** | **PASS** |
-
-**Headline results:**
-
-- **INT8 KV is essentially lossless** (Δppl = +0.0008, well under the
-  0.2 threshold). Combined with 0.51× memory and tied latency vs v3,
-  INT8 is a no-brainer drop-in.
-- **INT4 KIVI clears the < 0.5 target with margin** (Δppl = +0.196).
-  At 0.27× memory AND 1.29× latency over v3, this is the headline win
-  of Phase 2.
-- **KIVI's per-channel K is worth 2.36× in quality at the same bit
-  depth** vs naive per-token K (0.196 vs 0.462). The K-side outliers
-  matter; the design doc's "K has persistent per-channel outliers; V
-  does not" prediction held experimentally.
-
-**Why the kernel-level 42% mean rel err didn't tank perplexity:** that
-number was measured on i.i.d. random gaussian inputs — uniformly hard
-for symmetric per-token quantization. Real activations have structure
-(per-channel outliers in K captured by KIVI's per-channel scales; V
-distribution narrower than worst case). The softmax's max-subtraction
-also makes the attention output relatively robust to per-element noise
-in V — only the ranking of large scores survives.
-
-**Not measured:** decode tokens/sec at the model level. That requires
-threading our `decode_attention_int4` CUDA kernel into Llama's actual
-KV-cache decode loop — Phase 4 integration work. The kernel-level
-benchmark (`benchmarks/bench_kv_cache.py`) shows the steady-state
-attention call is 1.29× faster with INT4 KV than fp16 KV, which is
-the direct decode-step speedup.
+**Not measured (deferred to Phase 4):** decode tokens/sec at the model
+level. The kernel-level bench shows the steady-state attention call is
+1.29× faster with INT4 KV than fp16 KV; threading our
+`decode_attention_int4` into Llama's actual KV-cache decode loop is
+Phase 4 integration work.
