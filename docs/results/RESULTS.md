@@ -41,8 +41,8 @@ PyTorch SDPA 1.36 ms. Clocks not yet locked (TODO before `ncu` runs).
 
 | Step | Commit | Latency | Achieved BW | Speedup vs prev | Cause (ncu metric) |
 |------|--------|---------|-------------|-----------------|--------------------|
-| v0 naive (two-pass softmax) | _HEAD_ | 1.669 ms | 80 GB/s | — (baseline) | per-`j` block reductions in phase 1 serialize compute; KV is read in two passes (K in phase 1, V in phase 3); GQA reads not de-duplicated across query heads sharing a kv head. ncu profile pending (lock clocks first). |
-| + online softmax | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| v0 naive (two-pass softmax) | 46930c2 | 1.669 ms | 80 GB/s | — (baseline) | per-`j` block reductions in phase 1 serialize compute; KV is read in two passes (K in phase 1, V in phase 3); GQA reads not de-duplicated across query heads sharing a kv head. ncu profile pending (lock clocks first). |
+| + online softmax (v1) | _HEAD_ | 2.078 ms | 65 GB/s | **0.80× (regression)** | textbook Milakov–Gimelshein recurrence per-thread. Two regressions vs v0: (1) **redundant exp work** — every thread re-computes the same scalar `alpha = exp(m_old−m_new)` and `p_j = exp(s_j−m_new)`, so the block does ~128× as many `__expf` calls as v0's phase 2; (2) **lost streaming pipeline** — v0's phase 3 is a sync-free `o += s[j]·v[j,tid]` loop the compiler can unroll/pipeline, whereas v1 interleaves V loads with the per-`j` sync, blocking V prefetch. The single-pass + unbounded-seqlen properties are still wins; v2 fixes the redundancy. ncu pending. |
 | + warp reductions | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + vectorized loads | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + split-K (FlashDecoding) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
