@@ -122,8 +122,36 @@ below improves, one measured step at a time.
 - Milakov & Gimelshein, *Online normalizer calculation for softmax* (2018)
 - vLLM, *PagedAttention* (Kwon et al. 2023)
 
-## Findings (fill in as you go)
+## Findings
 
-_Naive kernel: ___ µs, ___% peak BW._
-_After optimization N: ___ µs (___×), cause: ___._
-_Gap to flash_attn: ___% — explanation: ___._
+The full narrative — theory, design, measured result, and lesson learned
+for each step (including the failed-experiment detours that taught us the
+most) — lives in [`01-fused-attention-journey.md`](01-fused-attention-journey.md).
+The per-step latency / bandwidth table is in
+[`results/RESULTS.md`](results/RESULTS.md).
+
+Current state on `main`: **v3, single-warp block + vectorized 64-bit KV
+loads, 0.713 ms / 189 GB/s at the reference workload — 2.34× over the v0
+baseline and 1.91× faster than PyTorch SDPA.** v4 (FlashDecoding split-K)
+was explored and reverted: it regressed across every batch size we tried,
+because our workload was bandwidth-bound at the per-SM ceiling, not
+grid-undersized.
+
+Key lessons from this phase:
+
+1. **SIMT-parallel ALU is essentially free** — see the v1 detour where
+   moving redundant scalar compute to a single lane *worsened* perf by
+   ~190 µs.
+2. **`__syncthreads()` is a load barrier the compiler respects** — V loads
+   must be hoisted above the sync manually (the v1 prefetch fix).
+3. **Removing a shmem broadcast hop can dwarf removing the sync itself** —
+   v2's structural change beat the sync-removal prediction by 4×.
+4. **Occupancy is a means, not an end** — v3 traded 4 warps/block for 1
+   warp/block and won 1.50× because the lost warps were idle at barriers.
+5. **Don't add parallelism where the bottleneck isn't compute** — v4's
+   split-K added SMs but couldn't unlock more bandwidth from the same pie.
+
+Still open: headline comparison against `flash_attn`'s decode kernel
+(SDPA dispatches to FA/cuDNN but a direct apples-to-apples run is pending),
+`ncu` profile with locked clocks for the "Cause" column in RESULTS.md, and
+v5 (`cp.async` double-buffering of KV tiles).
