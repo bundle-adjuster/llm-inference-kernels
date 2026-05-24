@@ -1,43 +1,53 @@
 #include "attention/fused_attention.cuh"
 #include "common/cuda_utils.cuh"
-#include <cuda_pipeline.h>
 
-// Decode attention — v5, cp.async double-buffered KV tiles.
+// Decode attention — v3, single-warp block + vectorized KV loads.
 // Layout & contract: kernels/attention/fused_attention.cuh
 //
-// v3's V prefetch papers over load latency via compiler scheduling: nvcc
-// hoists one load before consumption, hiding it behind the per-`j`
-// warp_reduce_sum. v5 makes that pipelining *explicit* with cp.async:
-// each tile (K[j, :] + V[j, :]) is staged into a 2-slot dynamic shmem
-// buffer via cp.async, fired and forgotten. While iter j consumes its
-// tile, iter j+1's tile is already in flight to the other shmem slot.
+// Algorithm: same Milakov–Gimelshein online softmax as v1/v2. Two changes
+// from v2:
 //
-//   prime:    issue load(tile_0 -> slot 0)
-//   for j in [0, seqlen_kv):
-//     if j+1 < seqlen_kv: issue load(tile_{j+1} -> slot ((j+1)&1))
-//     __pipeline_wait_prior(N)        // N=1 with prefetch, 0 on last iter
-//     read slot (j&1) from shmem; warp_reduce_sum; online softmax + V FMA
+//   1. Single-warp blocks (blockDim.x == 32). Each thread now owns
+//      VEC = head_dim / 32 = 4 d-lanes (vs 1 d-lane with the v2 128-thread
+//      block). The whole dot-product reduction now fits inside one warp, so
+//      every `__syncthreads()` and every cross-warp shmem slot from v2 is
+//      gone. The block reduce is just `warp_reduce_sum` on a 4-element
+//      per-thread partial.
 //
-// cp.async bypasses L1 (goes L2 -> shmem). For decode attention, K+V per
-// head is ~2 MB while L1 is 128 KB, so L1 wasn't catching anything anyway.
-// Shmem cost: 2 stages × head_dim × 2 (K+V) × 2 B = ~1 KB total.
+//   2. Vectorized 64-bit KV loads. Each thread loads VEC halves at a time
+//      via uint2 + __half22float2 (LDG.E.64). One warp-wide K load is now
+//      32 × 8 = 256 bytes (= head_dim halves = one full j) in a single
+//      instruction, where v2 needed four 64-byte warp loads.
 //
-// Per-thread invariant: each thread cp.asyncs only its own 8-byte slot
-// and reads back only its own slot. No cross-thread shmem traffic in the
-// pipeline, so no __syncwarp() needed between wait and consume.
+// Trade-off: per-block thread count drops 4×, so per-SM occupancy drops
+// from 12 blocks (48 warps, full) to ~16 blocks (16 warps, ~33%). The
+// per-warp load throughput from vectorization has to compensate for the
+// lost latency-hiding warps.
+//
+// Per kv position j, in one pass:
+//   k_v, v_v = load_half4_as_float4 of K[j, tid*VEC ..] and V[j, tid*VEC ..]
+//   partial  = Σ_d q_v[d] · k_v[d]                            (4 FMAs per thread)
+//   s_j      = scale · warp_reduce_sum(partial)               (one shfl tree;
+//                                                              every lane gets s_j)
+//   m_new    = max(m, s_j)
+//   alpha    = exp(m - m_new)
+//   p_j      = exp(s_j - m_new)
+//   o_v[d]   = o_v[d] · alpha + p_j · v_v[d]                  (4 FMAs per thread)
+//   l        = l · alpha + p_j
+//   m        = m_new
+// At end:  out[tid*VEC ..] = o_v / l                          (vectorized store)
+//
+// fp16 in/out, fp32 accumulation.
 //
 // Roadmap (one commit + one RESULTS.md row per step, see docs/01):
 //   v0  naive, two-pass softmax
 //   v1  online (streaming) softmax, single pass
 //   v2  warp-level reductions (single-sync block reduce)
-//   v3  vectorized KV loads (single-warp block, 64-bit per thread)
-//   v4  split-K over the KV sequence + combine (FlashDecoding) — reverted
-//   v5  cp.async double-buffering of KV tiles                       <-- here
+//   v3  vectorized KV loads (single-warp block, 64-bit per thread)    <-- here
+//   v4  split-K over the KV sequence + combine (FlashDecoding)
+//   v5  cp.async double-buffering of KV tiles
 
 namespace {
-
-constexpr int VEC        = 4;   // halves per thread per vec load (8 B)
-constexpr int NUM_STAGES = 2;   // double buffer
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     #pragma unroll
@@ -47,6 +57,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
+// 8-byte aligned 4-half load → float4. Compiles to one LDG.E.64.
 __device__ __forceinline__ float4 load_half4_as_float4(const half* ptr) {
     const uint2 raw = *reinterpret_cast<const uint2*>(ptr);
     half2 lo, hi;
@@ -57,6 +68,7 @@ __device__ __forceinline__ float4 load_half4_as_float4(const half* ptr) {
     return make_float4(f_lo.x, f_lo.y, f_hi.x, f_hi.y);
 }
 
+// Inverse of the above. Compiles to one STG.E.64.
 __device__ __forceinline__ void store_float4_as_half4(half* ptr, const float4 v) {
     const half2 lo = __floats2half2_rn(v.x, v.y);
     const half2 hi = __floats2half2_rn(v.z, v.w);
@@ -68,15 +80,13 @@ __device__ __forceinline__ void store_float4_as_half4(half* ptr, const float4 v)
 
 }  // namespace
 
-__global__ void decode_attention_kernel_v5(
+__global__ void decode_attention_kernel_v3(
     const half* __restrict__ q, const half* __restrict__ k,
     const half* __restrict__ v, half* __restrict__ out,
     int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
     float softmax_scale) {
 
-    extern __shared__ half kv_smem[];
-    half* k_buf = kv_smem;                                // [NUM_STAGES][head_dim]
-    half* v_buf = kv_smem + NUM_STAGES * head_dim;        // [NUM_STAGES][head_dim]
+    constexpr int VEC = 4;  // halves per thread per load (8 bytes)
 
     const int batch_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -89,49 +99,28 @@ __global__ void decode_attention_kernel_v5(
     const half* v_base = v + (batch_idx * n_kv_heads + kv_head_idx) * seqlen_kv * head_dim;
     half*       o_ptr  = out + (batch_idx * n_heads  + head_idx)    * head_dim + tid * VEC;
 
+    // Load q (4 halves per thread).
     const float4 q_v = load_half4_as_float4(q_ptr);
 
-    float4 o_v     = {0.0f, 0.0f, 0.0f, 0.0f};
+    float4 o_v   = {0.0f, 0.0f, 0.0f, 0.0f};
     float  m_state = -INFINITY;
     float  l_state = 0.0f;
 
-    // Prime the pipeline: issue tile 0 -> slot 0.
-    __pipeline_memcpy_async(k_buf + 0 * head_dim + tid * VEC,
-                            k_base + 0 * head_dim + tid * VEC, 8);
-    __pipeline_memcpy_async(v_buf + 0 * head_dim + tid * VEC,
-                            v_base + 0 * head_dim + tid * VEC, 8);
-    __pipeline_commit();
-
     for (int j = 0; j < seqlen_kv; ++j) {
-        const int cur  = j & 1;
-        const int next = (j + 1) & 1;
+        // Vectorized K + V loads at the top of the iteration. V is unused
+        // until after the reduce and softmax update; its latency hides behind
+        // both.
+        const float4 k_v = load_half4_as_float4(k_base + j * head_dim + tid * VEC);
+        const float4 v_v = load_half4_as_float4(v_base + j * head_dim + tid * VEC);
 
-        if (j + 1 < seqlen_kv) {
-            // Prefetch tile j+1 into slot 'next'.
-            __pipeline_memcpy_async(k_buf + next * head_dim + tid * VEC,
-                                    k_base + (j + 1) * head_dim + tid * VEC, 8);
-            __pipeline_memcpy_async(v_buf + next * head_dim + tid * VEC,
-                                    v_base + (j + 1) * head_dim + tid * VEC, 8);
-            __pipeline_commit();
-            // Wait until 1 group remains: the j+1 prefetch can stay in flight,
-            // but tile j's load (committed last iter / prime) must be done.
-            __pipeline_wait_prior(1);
-        } else {
-            // Last iter: no prefetch. Drain to 0 outstanding.
-            __pipeline_wait_prior(0);
-        }
-        // Each thread reads only its own slot from shmem — no cross-thread
-        // shmem traffic, so no __syncwarp needed.
-
-        const float4 k_v = load_half4_as_float4(k_buf + cur * head_dim + tid * VEC);
-        const float4 v_v = load_half4_as_float4(v_buf + cur * head_dim + tid * VEC);
-
-        // Same body as v3: dot product, warp reduce, online softmax + FMA.
+        // Local dot product across this thread's 4 d-lanes.
         float partial = q_v.x * k_v.x + q_v.y * k_v.y
                       + q_v.z * k_v.z + q_v.w * k_v.w;
+        // Single-warp block reduce — every lane gets the same s_j.
         partial = warp_reduce_sum(partial);
         const float s_j = partial * softmax_scale;
 
+        // Online softmax + output accumulator update.
         const float m_new = fmaxf(m_state, s_j);
         const float alpha = __expf(m_state - m_new);
         const float p_j   = __expf(s_j     - m_new);
@@ -152,11 +141,9 @@ void launch_decode_attention(
     const half* q, const half* k, const half* v, half* out,
     int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
     float softmax_scale, cudaStream_t stream) {
-    dim3 block(32);
+    dim3 block(32);             // 1 warp; head_dim handled via 4-way per-thread vec.
     dim3 grid(batch, n_heads);
-    // K + V, each double-buffered, fp16. ~1 KB at head_dim=128.
-    const size_t smem_bytes = NUM_STAGES * head_dim * sizeof(half) * 2;
-    decode_attention_kernel_v5<<<grid, block, smem_bytes, stream>>>(
+    decode_attention_kernel_v3<<<grid, block, 0, stream>>>(
         q, k, v, out, batch, n_heads, n_kv_heads, seqlen_kv, head_dim, softmax_scale);
     CUDA_CHECK_LAST();
 }

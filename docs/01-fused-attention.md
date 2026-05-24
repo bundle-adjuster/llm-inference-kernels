@@ -132,10 +132,11 @@ The per-step latency / bandwidth table is in
 
 Current state on `main`: **v3, single-warp block + vectorized 64-bit KV
 loads, 0.713 ms / 189 GB/s at the reference workload — 2.34× over the v0
-baseline and 1.91× faster than PyTorch SDPA.** v4 (FlashDecoding split-K)
-was explored and reverted: it regressed across every batch size we tried,
-because our workload was bandwidth-bound at the per-SM ceiling, not
-grid-undersized.
+baseline and 1.91× faster than PyTorch SDPA.** Both v4 (FlashDecoding
+split-K) and v5 (`cp.async` double-buffer) were explored and reverted —
+each regressed by ~50–90 µs across the batch sweep, for different reasons
+(bandwidth-bound at the per-SM ceiling for v4; per-iter shmem hop cost
+for v5).
 
 Key lessons from this phase:
 
@@ -150,8 +151,12 @@ Key lessons from this phase:
    warp/block and won 1.50× because the lost warps were idle at barriers.
 5. **Don't add parallelism where the bottleneck isn't compute** — v4's
    split-K added SMs but couldn't unlock more bandwidth from the same pie.
+6. **`cp.async` needs heavy per-tile compute to amortise its shmem hop** —
+   v5 paid an extra shmem write + read per iter, and nvcc was already
+   doing the implicit pipelining anyway, so the explicit version lost.
 
 Still open: headline comparison against `flash_attn`'s decode kernel
 (SDPA dispatches to FA/cuDNN but a direct apples-to-apples run is pending),
-`ncu` profile with locked clocks for the "Cause" column in RESULTS.md, and
-v5 (`cp.async` double-buffering of KV tiles).
+and `ncu` profile with locked clocks for the "Cause" column in RESULTS.md.
+Phase 1's optimization roadmap (v0–v5) is exhausted; the stretch goals —
+tensor-core MMA path and prefill FA-2 forward — remain.

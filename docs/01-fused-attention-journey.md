@@ -326,6 +326,89 @@ reverts the kernel to v3 so `main` runs the fast path.
 
 ---
 
+## v5 — `cp.async` double-buffered KV tiles — **explored, reverted**  ·  commit `78a28ff` (revert follows)
+
+### Theory
+
+v3's V prefetch papers over load latency via the compiler scheduler:
+nvcc can hoist *one* load before its consumer, hiding it behind the
+warp_reduce_sum, but it can't pipeline N tiles deep because each iter
+depends on the previous's `(m, l, O_acc)`. **`cp.async`** (Ampere+) is the
+hardware feature that exposes deeper pipelining: it issues a load
+asynchronously to shared memory, lets the thread keep going, and
+`__pipeline_wait_prior(N)` blocks just enough — only when the data is
+actually needed.
+
+The standard pattern is **double buffering**: while iter j processes its
+tile (read from slot `j & 1`), iter j+1's load is already in flight to
+the *other* slot.
+
+### Design choices
+
+- Two-slot shmem buffer: `extern __shared__ half kv_smem[]` of size
+  `NUM_STAGES × head_dim × 2 (K + V) × 2 B = 1 KB` total.
+- Per-thread cp.async of 8 bytes (one `LDG.E.64` equivalent): each thread
+  copies only its own 4-half slice of the tile, and only reads its own
+  slice back. No cross-thread shmem traffic, so no `__syncwarp()` between
+  wait and consume.
+- Pipeline: prime tile 0 → slot 0; in the loop, prefetch tile j+1, then
+  `__pipeline_wait_prior(1)`, read tile j from `slot (j & 1)`. Last iter
+  has no prefetch and uses `wait_prior(0)`.
+
+### Result — regression at every batch tried
+
+| batch | SDPA  | v3       | v5       |
+|------:|------:|---------:|---------:|
+| 1     | 0.135 | 0.467 ms | 0.536 ms |
+| 2     | 0.328 | 0.463 ms | 0.536 ms |
+| 4     | 0.695 | 0.441 ms | 0.506 ms |
+| 8     | 1.359 | 0.715 ms | 0.760 ms |
+
+Uniformly ~50 µs slower than v3.
+
+### Diagnosis — why deeper pipelining didn't help
+
+**cp.async writes only to shmem.** Where v3 went `global → register`
+directly, v5 goes `global → shmem (cp.async) → register (load)`. That's
+one extra shmem write *and* one extra shmem read per iter. At ~10 cycles
+combined × 4096 iters = ~40k cycles per block — measurable.
+
+What we expected to win: explicit overlap of the next tile's load with
+this tile's compute, beyond what nvcc was already doing in v3 via
+ordinary load latency hiding (the inline V prefetch from v1).
+
+What actually happened: nvcc's compiler-scheduled pipelining in v3 was
+already capturing most of the available overlap. Making the pipeline
+explicit didn't expose new headroom — but the shmem hop was a new fixed
+cost. cp.async also bypasses L1 (goes L2-only). Neutral here since K+V
+per head (~2 MB) doesn't fit L1 (128 KB) anyway, but it's worth knowing
+as a tradeoff.
+
+We did *not* try `NUM_STAGES = 3` or 4. Deeper pipelining hides more load
+latency but doesn't reduce the per-iter shmem hop cost — that's
+depth-independent. With shmem cost dominating, more depth wouldn't move
+the needle.
+
+### Lesson
+
+**`cp.async` is the wrong tool when per-iter compute is small relative to
+per-iter shmem access cost.** It shines when the compute per tile is
+heavy enough to fully overlap N tile loads (e.g., MMA-heavy prefill or
+GEMM), so the shmem hop is amortised. For decode attention with
+short per-iter compute, the compiler-scheduled global load + register
+pipelining in v3 is already near-optimal for this access pattern.
+
+The other condition for `cp.async` to win: load latency must be the
+bottleneck. For us, ~189 GB/s of 1008 peak is only 19% — so latency
+isn't fully hidden — but the per-SM bandwidth is the ceiling (we proved
+that in v4), and `cp.async` doesn't change per-SM bandwidth.
+
+### Decision
+
+v5 source preserved at `78a28ff`; follow-up commit restores v3 on `main`.
+
+---
+
 ## Summary
 
 | Step                        | Latency   | BW (GB/s) | vs v0    | vs SDPA  |
@@ -338,6 +421,7 @@ reverts the kernel to v3 so `main` runs the fast path.
 | v2 (single-sync reduce)     | 1.069 ms  |   126     | 1.56×    | 1.27×    |
 | **v3 (vec loads, 1-warp)**  | **0.713 ms** | **189** | **2.34×** | **1.91×** |
 | v4 split-K (reverted)       | 0.802 ms  |   167     | 2.08×    | 1.70×    |
+| v5 cp.async (reverted)      | 0.760 ms  |   177     | 2.20×    | 1.79×    |
 
 ### Lessons we want to carry forward
 
@@ -363,7 +447,14 @@ reverts the kernel to v3 so `main` runs the fast path.
    If per-SM HBM/L2 throughput is the ceiling, more SMs just split the same
    pie (v4).
 
-6. **Test the wrong hypothesis cheaply.** v1's "redundant exp" theory
+6. **`cp.async` requires heavy per-tile compute to amortise the shmem
+   hop.** It writes only to shmem, so you pay an extra shmem write + read
+   per tile. For decode attention with light per-iter compute, the hop
+   costs more than the explicit pipelining wins — and nvcc was already
+   doing the available overlap implicitly through the compiler schedule
+   on direct register loads (v5).
+
+7. **Test the wrong hypothesis cheaply.** v1's "redundant exp" theory
    would have been our headline optimization had we not measured it. The
    measurement disproved it; the disproof taught us the SIMT lesson.
 
@@ -375,8 +466,8 @@ reverts the kernel to v3 so `main` runs the fast path.
 - **`ncu` profile.** Every "Cause" cell in `RESULTS.md` says "pending"
   because we haven't run with locked clocks. Profiler-backed causes are
   worth more than reasoned ones.
-- **v5: `cp.async` double-buffering** of KV tiles. The V prefetch in v1
-  papers over load latency at the compiler-scheduling layer; `cp.async`
-  attacks it directly with explicit asynchronous loads + a second buffer.
-  This is the remaining roadmap step before declaring decode-attention
-  done.
+- **Phase 1 optimization roadmap is exhausted.** v0–v5 are all tried;
+  v3 is the kernel on `main`. Phase 1 declared done at **0.713 ms / 189
+  GB/s, 1.91× faster than PyTorch SDPA on the reference workload.** The
+  stretch goals — tensor-core MMA path, prefill FA-2 forward kernel —
+  remain open in the docs/01 roadmap.
