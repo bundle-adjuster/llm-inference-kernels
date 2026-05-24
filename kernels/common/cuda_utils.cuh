@@ -80,3 +80,40 @@ __device__ __forceinline__ float4 load_int8x4_as_float4(const int8_t* ptr) {
         static_cast<float>(static_cast<int8_t>((packed >> 16) & 0xFF)),
         static_cast<float>(static_cast<int8_t>((packed >> 24) & 0xFF)));
 }
+
+
+// ---- INT4 (packed) unpack helpers ----
+//
+// Packed convention: one int8 byte holds two signed 4-bit values in [-7, 7].
+//   byte = (q_lo & 0xF) | ((q_hi & 0xF) << 4)
+//   where q_lo is at the EVEN channel index (d, d+2, ...) and q_hi is at
+//   the ODD index (d+1, d+3, ...). The reference oracle (PyTorch
+//   reference/kv_cache_ref.py) stores in this same layout for direct test
+//   comparison.
+//
+// Sign-extension: shift the nibble into the high 4 bits, then arithmetic
+// right shift back. In CUDA PTX, right shift of a signed int is arithmetic
+// (sign-preserving), so `static_cast<int8_t>(b << 4) >> 4` works.
+
+__device__ __forceinline__ float unpack_int4_lo(uint8_t b) {
+    const int8_t v = static_cast<int8_t>(b << 4) >> 4;
+    return static_cast<float>(v);
+}
+
+__device__ __forceinline__ float unpack_int4_hi(uint8_t b) {
+    const int8_t v = static_cast<int8_t>(b) >> 4;
+    return static_cast<float>(v);
+}
+
+// 2 packed bytes (4 nibbles) -> float4. One uint16 load is sufficient on
+// 2-byte alignment.
+__device__ __forceinline__ float4 load_int4x4_as_float4(const int8_t* ptr) {
+    const uint16_t packed = *reinterpret_cast<const uint16_t*>(ptr);
+    const uint8_t b0 = static_cast<uint8_t>(packed & 0xFF);
+    const uint8_t b1 = static_cast<uint8_t>((packed >> 8) & 0xFF);
+    return make_float4(
+        unpack_int4_lo(b0),
+        unpack_int4_hi(b0),
+        unpack_int4_lo(b1),
+        unpack_int4_hi(b1));
+}

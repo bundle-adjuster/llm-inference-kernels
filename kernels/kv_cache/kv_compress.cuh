@@ -20,3 +20,29 @@ void launch_quantize_per_token(
     const half* x, int8_t* x_q, half* scales,
     int batch, int n_kv_heads, int seqlen, int head_dim,
     cudaStream_t stream);
+
+
+// INT4 KIVI quantization — K per-channel groupwise, V per-token.
+// Each int8 byte holds two signed 4-bit values in [-7, 7]:
+//   byte = (q_lo & 0xF) | ((q_hi & 0xF) << 4)
+//   where q_lo is at the even channel index and q_hi at the odd.
+//
+// K (per-channel groupwise):
+//   x       : [batch, n_kv_heads, seqlen,     head_dim    ]  fp16
+//   x_q     : [batch, n_kv_heads, seqlen,     head_dim/2  ]  int8 (packed)
+//   scales  : [batch, n_kv_heads, n_groups,   head_dim    ]  fp16
+//     where n_groups = ceil(seqlen / group_size).
+void launch_quantize_k_per_channel_groupwise_int4(
+    const half* x, int8_t* x_q, half* scales,
+    int batch, int n_kv_heads, int seqlen, int head_dim,
+    int group_size, int n_groups,
+    cudaStream_t stream);
+
+// V (per-token):
+//   x       : [batch, n_kv_heads, seqlen, head_dim    ]  fp16
+//   x_q     : [batch, n_kv_heads, seqlen, head_dim/2  ]  int8 (packed)
+//   scales  : [batch, n_kv_heads, seqlen]               fp16
+void launch_quantize_v_per_token_int4(
+    const half* x, int8_t* x_q, half* scales,
+    int batch, int n_kv_heads, int seqlen, int head_dim,
+    cudaStream_t stream);

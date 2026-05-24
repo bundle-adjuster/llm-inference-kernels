@@ -135,5 +135,39 @@ in Phase 2c (INT4): four-bit loads can use `LDG.E.16` patterns and may
 expose different bottlenecks, but the dependency-chain analysis above
 predicts a latency tie there too.
 
-**Phase 2c — INT4 KIVI (per-channel K, per-token V): pending.**
-**Phase 2d — perplexity / decode tok/s: pending.**
+**Phase 2c — INT4 KIVI (landed):**
+
+- **Memory: 0.27× of fp16** (128 MiB → 34.5 MiB on the reference workload;
+  93.5 MiB saved). K storage is `head_dim/2` packed bytes per token + a small
+  per-channel-per-group scales table; V storage is `head_dim/2` packed bytes
+  per token + one fp16 per-token scale.
+- **Kernel latency: 0.554 ms — 1.29× faster than v3 (0.715 ms).** INT4
+  *moves the needle* where INT8 didn't. The structural change: K scales
+  load **once per group** (every 32 inner iters), held in registers
+  through the group's inner loop, and pre-folded into q via
+  `q_scaled[d] = q[d] · k_scale[g, d]` at each group boundary. The inner
+  loop is then 4 multiplies on int values + warp_reduce + softmax + 4
+  FMAs on int values — denser than INT8's per-iter K scale load on top
+  of the dot product. Inner-loop K_q and V_q loads are also smaller
+  (`LDG.E.16`, 2 B/thread, one uint16 unpacked to 4 nibbles).
+- **Accuracy on random gaussians: max abs diff vs fp16 reference 2.3e-2,
+  mean rel err 42%.** Below INT4's per-element noise floor (`1/7 ≈ 14%`)
+  amplified through the softmax. This is the kernel-level number on
+  worst-case (random) data; perplexity on real LLM activations is the
+  Phase 2d question, and the KIVI paper's result suggests the per-channel
+  K helps a lot there because K's persistent outliers get their own scales.
+- **Quantize one-shot costs:** K (per-channel groupwise) 0.07 ms; V
+  (per-token packed) 0.12 ms. In serving these amortise to per-appended-
+  token costs.
+
+**Why INT4 moves latency where INT8 tied** (the surprise vs the Phase 2b
+diagnosis): INT8 still loaded one fp16 K scale *per j*, which the
+dependency chain couldn't hide. INT4 KIVI loads K scales once per 32 j's,
+so the per-iter load count drops by ~one. Combined with the smaller K_q +
+V_q loads, the inner loop's instruction throughput is meaningfully higher.
+The dependency-chain-bound diagnosis from 2b still applies, but the chain
+itself got lighter in 2c.
+
+**Phase 2d — perplexity / decode tok/s: pending.** The headline question
+is whether the 42% kernel-level mean rel err translates to a perplexity
+delta within KIVI's threshold (≤ 0.5).

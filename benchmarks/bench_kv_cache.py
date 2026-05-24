@@ -45,40 +45,55 @@ def main() -> None:
 
     # Pre-quantize K and V once: in serving you'd quantize on-append (one
     # new token per decode step), but that one-shot cost is reported below.
-    k_q, k_s = llmik_cuda.quantize_per_token(k)
-    v_q, v_s = llmik_cuda.quantize_per_token(v)
+    k_q8,  k_s8  = llmik_cuda.quantize_per_token(k)
+    v_q8,  v_s8  = llmik_cuda.quantize_per_token(v)
+    int4_group_size = 32
+    k_q4,  k_s4  = llmik_cuda.quantize_k_per_channel_groupwise_int4(k, int4_group_size)
+    v_q4,  v_s4  = llmik_cuda.quantize_v_per_token_int4(v)
 
-    fp16_kv_bytes  = (k.numel() + v.numel()) * 2
-    int8_kv_bytes  = (k_q.numel() + v_q.numel()) + (k_s.numel() + v_s.numel()) * 2
+    fp16_kv_bytes = (k.numel() + v.numel()) * 2
+    int8_kv_bytes = (k_q8.numel() + v_q8.numel()) + (k_s8.numel() + v_s8.numel()) * 2
+    int4_kv_bytes = (k_q4.numel() + v_q4.numel()) + (k_s4.numel() + v_s4.numel()) * 2
 
     print(f"workload: batch={batch} n_heads={n_heads} kv_heads={n_kv_heads} "
           f"head_dim={head_dim} seqlen_kv={seqlen_kv}\n")
     print(f"  KV size  fp16: {fp16_kv_bytes / 1024 / 1024:6.2f} MiB")
     print(f"  KV size  int8: {int8_kv_bytes / 1024 / 1024:6.2f} MiB "
           f"({int8_kv_bytes / fp16_kv_bytes:.2f}× of fp16, "
-          f"{(fp16_kv_bytes - int8_kv_bytes) / 1024 / 1024:.2f} MiB saved)\n")
+          f"{(fp16_kv_bytes - int8_kv_bytes) / 1024 / 1024:.2f} MiB saved)")
+    print(f"  KV size  int4: {int4_kv_bytes / 1024 / 1024:6.2f} MiB "
+          f"({int4_kv_bytes / fp16_kv_bytes:.2f}× of fp16, "
+          f"{(fp16_kv_bytes - int4_kv_bytes) / 1024 / 1024:.2f} MiB saved)"
+          f"   [int4 group_size={int4_group_size}]\n")
 
     # --- correctness sanity ---
     ref = decode_attention(q.unsqueeze(2), k, v, scale=scale).squeeze(2)
     out_fp16 = llmik_cuda.decode_attention(q, k, v, scale)
     check_close(out_fp16, ref, name="v3 fp16 KV")
-    # INT8: compare against the dequantize-then-attention reference (same
-    # dequantized values as the kernel sees, so this isolates kernel
-    # correctness from quantization noise).
-    k_dq = (k_q.float() * k_s.float().unsqueeze(-1)).to(torch.float16)
-    v_dq = (v_q.float() * v_s.float().unsqueeze(-1)).to(torch.float16)
-    ref_int8 = decode_attention(q.unsqueeze(2), k_dq, v_dq, scale=scale).squeeze(2)
-    out_int8 = llmik_cuda.decode_attention_int8(q, k_q, k_s, v_q, v_s, scale)
-    check_close(out_int8, ref_int8, name="INT8 KV + fused dequant")
 
-    # Also measure the end-to-end accuracy delta (INT8 quantize → attention)
-    # vs the fp16 reference. This is the "what does INT8 cost in answer
-    # quality" number at the kernel level.
-    abs_err = (out_int8.float() - ref.float()).abs()
-    rel_err = (abs_err / ref.float().abs().clamp(min=1e-3)).mean().item()
-    print(f"\n  INT8 vs fp16 reference: max |diff| {abs_err.max().item():.3e}, "
-          f"mean rel err {rel_err:.3e}")
-    print(f"  Per-token quantization noise: ~1/127 of per-token max ≈ {1/127:.4f}")
+    # INT8: compare against fp16 attention on the dequantized values (same
+    # dequant the kernel sees, isolates kernel correctness from quant noise).
+    k_dq8 = (k_q8.float() * k_s8.float().unsqueeze(-1)).to(torch.float16)
+    v_dq8 = (v_q8.float() * v_s8.float().unsqueeze(-1)).to(torch.float16)
+    ref_int8 = decode_attention(q.unsqueeze(2), k_dq8, v_dq8, scale=scale).squeeze(2)
+    out_int8 = llmik_cuda.decode_attention_int8(q, k_q8, k_s8, v_q8, v_s8, scale)
+    check_close(out_int8, ref_int8, name="INT8 KV + fused dequant",
+                rtol=2e-2, atol=2e-2)
+
+    # INT4 KIVI accuracy delta vs fp16 reference (the "what does INT4 cost"
+    # number at the kernel level).
+    out_int4 = llmik_cuda.decode_attention_int4(q, k_q4, k_s4, v_q4, v_s4,
+                                                int4_group_size, scale)
+    abs_err8 = (out_int8.float() - ref.float()).abs()
+    rel_err8 = (abs_err8 / ref.float().abs().clamp(min=1e-3)).mean().item()
+    abs_err4 = (out_int4.float() - ref.float()).abs()
+    rel_err4 = (abs_err4 / ref.float().abs().clamp(min=1e-3)).mean().item()
+    print(f"\n  INT8 vs fp16 reference: max |diff| {abs_err8.max().item():.3e}, "
+          f"mean rel err {rel_err8:.3e}")
+    print(f"  INT4 vs fp16 reference: max |diff| {abs_err4.max().item():.3e}, "
+          f"mean rel err {rel_err4:.3e}")
+    print(f"  Quantization noise floor: INT8 ≈ 1/127 = {1/127:.4f}, "
+          f"INT4 ≈ 1/7 = {1/7:.4f}")
 
     # --- latency ---
     print()
@@ -87,15 +102,28 @@ def main() -> None:
     print(benchmark(lambda: llmik_cuda.decode_attention(q, k, v, scale),
                     name="v3 fp16 KV"))
     res_int8 = benchmark(
-        lambda: llmik_cuda.decode_attention_int8(q, k_q, k_s, v_q, v_s, scale),
+        lambda: llmik_cuda.decode_attention_int8(q, k_q8, k_s8, v_q8, v_s8, scale),
         name="INT8 KV + fused dequant")
     print(res_int8)
     print(f"  INT8 achieved KV bandwidth: "
           f"{achieved_bandwidth_gbps(int8_kv_bytes, res_int8.median_ms):.0f} GB/s")
+    res_int4 = benchmark(
+        lambda: llmik_cuda.decode_attention_int4(q, k_q4, k_s4, v_q4, v_s4,
+                                                 int4_group_size, scale),
+        name="INT4 KV (KIVI) + fused dequant")
+    print(res_int4)
+    print(f"  INT4 achieved KV bandwidth: "
+          f"{achieved_bandwidth_gbps(int4_kv_bytes, res_int4.median_ms):.0f} GB/s")
 
-    # Quantize cost (one-shot; in serving this runs per appended token).
+    # Quantize one-shot costs (in serving these amortise to per-appended-token).
+    print()
     print(benchmark(lambda: llmik_cuda.quantize_per_token(k),
-                    name="quantize_per_token (K only)"))
+                    name="quantize_per_token int8 (K)"))
+    print(benchmark(
+        lambda: llmik_cuda.quantize_k_per_channel_groupwise_int4(k, int4_group_size),
+        name="quantize_k int4 (per-channel)"))
+    print(benchmark(lambda: llmik_cuda.quantize_v_per_token_int4(v),
+                    name="quantize_v int4 (per-token)"))
 
 
 if __name__ == "__main__":

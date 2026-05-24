@@ -288,3 +288,122 @@ def test_cuda_decode_attention_int8_matches_dequant_reference(
     # same as the fp16 attention test: 2e-2 rtol/atol.
     torch.testing.assert_close(out_cuda.float(), out_ref.float(),
                                rtol=2e-2, atol=2e-2)
+
+
+# ---- INT4 KIVI: CUDA kernels vs PyTorch reference ----
+
+def _unpack_int4_packed(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of the CUDA packing: byte = (q_lo & 0xF) | ((q_hi & 0xF) << 4).
+
+    packed: [..., head_dim/2] int8
+    returns: [..., head_dim] int8 with each nibble sign-extended into int8.
+    """
+    *prefix, half_d = packed.shape
+    p = packed.to(torch.int32) & 0xFF  # treat as unsigned for the bit work
+
+    # Low nibble: shift to high bits then arithmetic shift back (sign-extend).
+    lo = ((p & 0x0F) << 4).to(torch.int8)
+    lo = lo >> 4
+
+    # High nibble: same trick.
+    hi = (p & 0xF0).to(torch.int8)
+    hi = hi >> 4
+
+    # Interleave: out[..., 2k] = lo, out[..., 2k+1] = hi.
+    out = torch.stack([lo, hi], dim=-1).reshape(*prefix, 2 * half_d)
+    return out.to(torch.int8)
+
+
+@requires_cuda
+@pytest.mark.parametrize("batch,seqlen", [(1, 128), (4, 1024)])
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_cuda_quantize_k_per_channel_groupwise_int4_matches_reference(
+    batch: int, seqlen: int, group_size: int,
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(batch, N_HEADS_KV, seqlen, HEAD_DIM,
+                    device="cuda", dtype=torch.float16)
+    # Inject K's per-channel outliers — same pattern as _make_kv on CPU.
+    x[..., ::17] *= 3.5
+
+    q_packed_cuda, s_cuda = llmik.quantize_k_per_channel_groupwise_int4(
+        x, group_size)
+    q_unpacked_cuda = _unpack_int4_packed(q_packed_cuda).to(torch.int8)
+
+    q_ref, s_ref = quantize_per_channel_groupwise(x.float(), bits=4,
+                                                  group_size=group_size)
+    q_ref = q_ref.to("cuda")
+    s_ref = s_ref.to("cuda").to(torch.float16)
+
+    torch.testing.assert_close(s_cuda.float(), s_ref.float(),
+                               rtol=1e-3, atol=1e-3)
+
+    diff = (q_unpacked_cuda.int() - q_ref.int()).abs()
+    assert (diff <= 1).all(), (
+        f"CUDA vs reference int4 K diff > 1 at {(diff > 1).sum().item()} positions"
+    )
+    assert diff.float().mean().item() < 0.05
+
+
+@requires_cuda
+@pytest.mark.parametrize("batch,seqlen", [(1, 128), (4, 1024), (8, 4096)])
+def test_cuda_quantize_v_per_token_int4_matches_reference(
+    batch: int, seqlen: int,
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(batch, N_HEADS_KV, seqlen, HEAD_DIM,
+                    device="cuda", dtype=torch.float16)
+
+    q_packed_cuda, s_cuda = llmik.quantize_v_per_token_int4(x)
+    q_unpacked_cuda = _unpack_int4_packed(q_packed_cuda).to(torch.int8)
+
+    q_ref, s_ref = quantize_per_token(x.float(), bits=4)
+    q_ref = q_ref.to("cuda")
+    s_ref = s_ref.to("cuda").to(torch.float16)
+
+    torch.testing.assert_close(s_cuda.float(), s_ref.float(),
+                               rtol=1e-3, atol=1e-3)
+
+    diff = (q_unpacked_cuda.int() - q_ref.int()).abs()
+    assert (diff <= 1).all()
+    assert diff.float().mean().item() < 0.05
+
+
+@requires_cuda
+@pytest.mark.parametrize("batch,seqlen_kv", [(1, 128), (4, 1024), (8, 2048)])
+def test_cuda_decode_attention_int4_matches_dequant_reference(
+    batch: int, seqlen_kv: int,
+) -> None:
+    """End-to-end KIVI: CUDA INT4 attention vs reference attention on the
+    dequantized K/V. Isolates kernel correctness from quantization noise."""
+    torch.manual_seed(0)
+    n_heads, n_kv_heads, head_dim = 32, N_HEADS_KV, HEAD_DIM
+    group_size = 32
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(batch, n_heads,    head_dim,
+                    device="cuda", dtype=torch.float16)
+    k = torch.randn(batch, n_kv_heads, seqlen_kv, head_dim,
+                    device="cuda", dtype=torch.float16)
+    v = torch.randn(batch, n_kv_heads, seqlen_kv, head_dim,
+                    device="cuda", dtype=torch.float16)
+
+    # CUDA quantize → CUDA INT4 attention.
+    k_q, k_s = llmik.quantize_k_per_channel_groupwise_int4(k, group_size)
+    v_q, v_s = llmik.quantize_v_per_token_int4(v)
+    out_cuda = llmik.decode_attention_int4(q, k_q, k_s, v_q, v_s,
+                                           group_size, scale)
+
+    # Reference: unpack CUDA's packed output back to int8, dequantize via the
+    # per-channel-groupwise / per-token reference, run fp32 attention.
+    k_q_unpacked = _unpack_int4_packed(k_q)
+    v_q_unpacked = _unpack_int4_packed(v_q)
+    k_dq = dequantize_per_channel_groupwise(k_q_unpacked, k_s, group_size).to(torch.float16)
+    v_dq = dequantize_per_token(v_q_unpacked, v_s).to(torch.float16)
+    out_ref = decode_attention(q.unsqueeze(2), k_dq, v_dq, scale=scale).squeeze(2)
+
+    # INT4 has 16x coarser quantization than INT8 (qmax=7 vs 127), so we
+    # need looser tolerance than the INT8 path. Errors come from fp16
+    # accumulation only — both paths see the exact same dequantized inputs.
+    torch.testing.assert_close(out_cuda.float(), out_ref.float(),
+                               rtol=5e-2, atol=5e-2)
