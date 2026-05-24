@@ -97,7 +97,43 @@ time allows.
 - Zhang et al., *H2O* (2023)
 - TensorRT-LLM INT8 KV cache; vLLM FP8 KV cache
 
-## Findings (fill in as you go)
+## Findings
 
-_INT8: ___× memory, ___ ppl delta._
-_INT4 (per-channel K): ___× memory, ___ ppl delta, ___ tokens/sec._
+**Phase 2b — INT8 per-token KV (landed):**
+
+- **Memory: 0.51× of fp16** (128 MiB → 65 MiB on the reference workload;
+  63 MiB saved). Scale overhead is ~1.5% — one fp16 scale per token,
+  shared across head_dim.
+- **Kernel latency: 0.713 ms, tied with v3 fp16 (0.713 ms).** Halving KV
+  bytes did not move latency — we measured the INT8 kernel at 96 GB/s
+  effective KV bandwidth vs v3's 189 GB/s, both well under HBM peak
+  (1008 GB/s). The decode kernel is **dependency-chain-bound**, not
+  bandwidth-bound: the per-`j` `warp_reduce_sum → softmax → FMA` critical
+  path is the limiter, and that shape is the same in both kernels.
+  Consistent with Phase 1's v4/v5 results (more SMs and more cp.async
+  pipelining also didn't help — bandwidth wasn't the ceiling on this
+  workload).
+- **Accuracy: max |diff| vs fp16 reference 1.1e-3, mean relative error
+  2.5%.** Below the per-element quantization-noise floor of `1/127 ≈
+  0.78%` per element, propagated through the softmax.
+- **Quantize-kernel one-shot cost: 0.124 ms** for the full K cache (64 MiB
+  fp16 → 32 MiB int8 + scales). In serving this is amortised: only the
+  newly appended token is quantized per decode step.
+- **Implementation notes:** scale-folding optimisation — instead of
+  per-lane dequant (4 multiplies/thread/iter to materialise k = k_int ·
+  k_scale), compute the partial dot on int values and multiply by
+  `k_scale` once after `warp_reduce_sum` (linearity); fold `v_scale` into
+  the FMA coefficient `p_j_scaled = p_j · v_scale`. Saves 8 multiplies
+  per iter vs naive dequant-everything. INT8 loaded as `LDG.E.32` (4 bytes
+  per thread vs v3's 8) — `head_dim/32 = 4` lanes fits cleanly into one
+  int32 load.
+
+**Implication for Phase 2's framing:** the value of INT8 KV here is *memory*,
+not latency. Same answer time + half the cache → ~2× longer context or
+~2× larger batch in the same VRAM budget. The latency story may change
+in Phase 2c (INT4): four-bit loads can use `LDG.E.16` patterns and may
+expose different bottlenecks, but the dependency-chain analysis above
+predicts a latency tie there too.
+
+**Phase 2c — INT4 KIVI (per-channel K, per-token V): pending.**
+**Phase 2d — perplexity / decode tok/s: pending.**

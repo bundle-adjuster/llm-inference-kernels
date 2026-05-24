@@ -57,11 +57,16 @@ seqlen_kv ∈ {128, 2048}.
 
 ## Track 2 — KV-cache compression
 
-| Variant | Commit | Memory | Perplexity Δ | Decode tok/s | Notes |
-|---------|--------|--------|--------------|--------------|-------|
-| FP16 KV (baseline) | _TBD_ | 1.0× | 0.0 | _TBD_ | |
-| INT8 KV | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
-| INT4 KV (per-channel K) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
+Microbench workload: same as Track 1 — Llama 3 8B head config (`n_heads=32,
+n_kv_heads=8, head_dim=128`), `batch=8, seqlen_kv=4096`, fp16 inputs.
+"Memory" = on-device steady-state KV-cache size including scale overhead.
+"Kernel latency" measured by `benchmarks/bench_kv_cache.py`.
+
+| Variant | Commit | Memory | Kernel latency | Perplexity Δ | Notes |
+|---------|--------|--------|----------------|--------------|-------|
+| FP16 KV (baseline) | _Track 1 v3_ | 128 MiB · 1.00× | 0.713 ms | 0.0 | v3 fused decode attention. 1.91× faster than PyTorch SDPA. |
+| INT8 KV per-token + fused dequant | _HEAD_ | 65 MiB · **0.51×** (63 MiB saved) | 0.713 ms (tied with v3) | _TBD (Phase 2d)_ | Symmetric per-token quantization (one fp16 scale per token, shared across head_dim). Kernel: same v3 body, ints loaded as `LDG.E.32` (4 bytes/thread vs v3's 8), scales folded out of per-lane dequant (`partial · k_scale` *after* `warp_reduce_sum`; `p_j_scaled = p_j · v_scale` folded into the V FMA). Latency parity with v3 despite half the KV bytes — kernel is dependency-chain-bound (warp reduce → softmax → FMA), not bandwidth-bound (96/1008 GB/s ≈ 9.5% of peak HBM). Accuracy: max abs diff vs fp16 reference 1.1e-3, mean rel err 2.5%. Quantize one-shot cost: 0.124 ms per K (full cache); in serving this amortises to per-appended-token cost. |
+| INT4 KV (per-channel K, per-token V) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 2c (KIVI) |
 
 ## Track 3 — Quantized matmul (W4A16)
 

@@ -47,38 +47,8 @@
 //   v4  split-K over the KV sequence + combine (FlashDecoding)
 //   v5  cp.async double-buffering of KV tiles
 
-namespace {
-
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_xor_sync(0xFFFFFFFFu, v, offset);
-    }
-    return v;
-}
-
-// 8-byte aligned 4-half load → float4. Compiles to one LDG.E.64.
-__device__ __forceinline__ float4 load_half4_as_float4(const half* ptr) {
-    const uint2 raw = *reinterpret_cast<const uint2*>(ptr);
-    half2 lo, hi;
-    *reinterpret_cast<unsigned int*>(&lo) = raw.x;
-    *reinterpret_cast<unsigned int*>(&hi) = raw.y;
-    const float2 f_lo = __half22float2(lo);
-    const float2 f_hi = __half22float2(hi);
-    return make_float4(f_lo.x, f_lo.y, f_hi.x, f_hi.y);
-}
-
-// Inverse of the above. Compiles to one STG.E.64.
-__device__ __forceinline__ void store_float4_as_half4(half* ptr, const float4 v) {
-    const half2 lo = __floats2half2_rn(v.x, v.y);
-    const half2 hi = __floats2half2_rn(v.z, v.w);
-    uint2 raw;
-    raw.x = *reinterpret_cast<const unsigned int*>(&lo);
-    raw.y = *reinterpret_cast<const unsigned int*>(&hi);
-    *reinterpret_cast<uint2*>(ptr) = raw;
-}
-
-}  // namespace
+// warp_reduce_sum, load_half4_as_float4, store_float4_as_half4 live in
+// common/cuda_utils.cuh (shared with the INT8 attention + quantize kernels).
 
 __global__ void decode_attention_kernel_v3(
     const half* __restrict__ q, const half* __restrict__ k,

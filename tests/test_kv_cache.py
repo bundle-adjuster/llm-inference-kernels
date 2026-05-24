@@ -19,6 +19,7 @@ import math
 import pytest
 import torch
 
+from reference.attention_ref import decode_attention
 from reference.kv_cache_ref import (
     dequantize_kv_int8_per_token,
     dequantize_kv_kivi_int4,
@@ -206,3 +207,84 @@ def test_int4_storage_quarter_when_packed() -> None:
     # V_scales: 1 scale per token = 1 / head_dim of V bits.
     # Total target band: ~0.26–0.30× fp16.
     assert 0.25 <= ratio <= 0.32, f"int4 storage ratio {ratio:.4f} out of band"
+
+
+# ---- CUDA kernels vs PyTorch reference ----
+
+llmik = pytest.importorskip(
+    "llmik_cuda",
+    reason="build the extension: python setup.py build_ext --inplace",
+)
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device required",
+)
+
+
+@requires_cuda
+@pytest.mark.parametrize("batch,seqlen", [(1, 128), (4, 1024), (8, 4096)])
+def test_cuda_quantize_per_token_matches_reference(batch: int, seqlen: int) -> None:
+    """The CUDA kernel must match the PyTorch reference exactly (modulo
+    a few rounding-direction ties — see tolerance below)."""
+    torch.manual_seed(0)
+    x = torch.randn(batch, N_HEADS_KV, seqlen, HEAD_DIM,
+                    device="cuda", dtype=torch.float16)
+
+    q_cuda, s_cuda = llmik.quantize_per_token(x)
+    q_ref, s_ref   = quantize_per_token(x.float(), bits=8)
+    q_ref = q_ref.to("cuda")
+    s_ref = s_ref.to("cuda").to(torch.float16)
+
+    # Scales: same fp32 computation → should be near-bitwise identical at fp16.
+    torch.testing.assert_close(s_cuda.float(), s_ref.float(), rtol=1e-3, atol=1e-3)
+
+    # Quantized values: round-to-nearest-even both sides, so they agree at
+    # all non-tie positions. Allow off-by-one at ties.
+    diff = (q_cuda.int() - q_ref.int()).abs()
+    assert (diff <= 1).all(), (
+        f"CUDA vs reference int8 diff > 1 at {(diff > 1).sum().item()} positions"
+    )
+    assert diff.float().mean().item() < 0.05, (
+        f"avg |diff| {diff.float().mean().item():.4f} too high — "
+        "more than 5% ties is suspicious"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("batch,seqlen_kv", [(1, 128), (4, 1024), (8, 2048)])
+def test_cuda_decode_attention_int8_matches_dequant_reference(
+    batch: int, seqlen_kv: int
+) -> None:
+    """End-to-end: quantize fp16 K/V via the CUDA kernel, run the INT8
+    attention kernel, compare against the PyTorch reference attention
+    on the *dequantized* K/V. The two paths see identical fp16 K/V (modulo
+    quantization noise), so they should agree within fp16 round-off."""
+    torch.manual_seed(0)
+    n_heads, n_kv_heads, head_dim = 32, N_HEADS_KV, HEAD_DIM
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q   = torch.randn(batch, n_heads,    head_dim,
+                      device="cuda", dtype=torch.float16)
+    k   = torch.randn(batch, n_kv_heads, seqlen_kv, head_dim,
+                      device="cuda", dtype=torch.float16)
+    v   = torch.randn(batch, n_kv_heads, seqlen_kv, head_dim,
+                      device="cuda", dtype=torch.float16)
+
+    # CUDA path: quantize K, V via the CUDA kernel; run INT8 attention.
+    k_q, k_s = llmik.quantize_per_token(k)
+    v_q, v_s = llmik.quantize_per_token(v)
+    out_cuda = llmik.decode_attention_int8(q, k_q, k_s, v_q, v_s, scale)
+
+    # Reference path: dequantize the SAME k_q/v_q back to fp16, then run the
+    # fp32 reference attention. This isolates "INT8 attention kernel
+    # correctness" from "quantization accuracy" — both paths see the same
+    # quantized inputs.
+    k_dq = (k_q.float() * k_s.float().unsqueeze(-1)).to(torch.float16)
+    v_dq = (v_q.float() * v_s.float().unsqueeze(-1)).to(torch.float16)
+    out_ref = decode_attention(q.unsqueeze(2), k_dq, v_dq, scale=scale).squeeze(2)
+
+    # The two paths differ only in how the dequantization is folded into the
+    # arithmetic (in-loop vs upfront materialise-to-fp16). Tolerance is the
+    # same as the fp16 attention test: 2e-2 rtol/atol.
+    torch.testing.assert_close(out_cuda.float(), out_ref.float(),
+                               rtol=2e-2, atol=2e-2)
