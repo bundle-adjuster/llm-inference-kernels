@@ -43,12 +43,18 @@ This project deliberately compares implementations along three axes:
 
 ## Results (filled in incrementally)
 
-| Kernel | Workload | Baseline | This repo | Speedup | Memory | Notes |
-|--------|----------|----------|-----------|---------|--------|-------|
-| Fused attention (decode) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 1 |
-| KV-cache compression | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 2 |
-| Quantized matmul (W4A16) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 3 |
-| End-to-end (Llama 3 8B) | _TBD_ | vanilla vLLM | _TBD_ | _TBD_ | _TBD_ | Phase 4 |
+Headline numbers on RTX 4090 (sm_89). Per-step breakdown lives in
+[`docs/results/RESULTS.md`](docs/results/RESULTS.md); the full v0→v5
+narrative for the attention kernel is in
+[`docs/01-fused-attention-journey.md`](docs/01-fused-attention-journey.md).
+
+| Kernel | Workload | Baseline | This repo | Speedup | Notes |
+|--------|----------|----------|-----------|---------|-------|
+| **Fused attention (decode)** | Llama 3 8B heads (`n_heads=32, n_kv_heads=8, head_dim=128`), `batch=8, seqlen_kv=4096`, fp16 | PyTorch SDPA 1.36 ms (dispatches to FlashAttention / cuDNN) | **v3: 0.713 ms, 189 GB/s achieved KV BW** | **1.91× over SDPA · 5.28× over PyTorch eager · 2.34× over our v0 baseline** | Phase 1 done; max abs diff vs fp32 reference = 3.1e-5 |
+| Phase 0 end-to-end (Llama 3.1 8B Instruct, batch 16, prompt 512 / gen 512) | greedy decode, EOS suppressed | HF `generate()` 23.10 s · vLLM 0.6.6 11.65 s | n/a (vendor-baseline phase) | vLLM 1.98× HF `generate()` | Phase 0 baselines, `bench_e2e.py` |
+| KV-cache compression | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 2 (next) |
+| Quantized matmul (W4A16) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | Phase 3 |
+| End-to-end (Llama 3 8B, kernels integrated) | _TBD_ | vanilla vLLM 703 tok/s | _TBD_ | _TBD_ | Phase 4 |
 
 ## Repo layout
 
@@ -85,5 +91,23 @@ python benchmarks/bench_attention.py
 
 ## Status
 
-See [`TODO.md`](TODO.md) for the phased, step-by-step plan. Current phase:
-**Phase 0 — environment & baselines.**
+See [`TODO.md`](TODO.md) for the phased, step-by-step plan.
+
+**Phase 0 — environment & baselines: done.** Reproducible conda env locked
+(`environment.lock.yml`), Llama 3.1 8B Instruct verified loading + generating
+at fp16, vLLM + HF `generate()` baselines captured in
+[`docs/results/RESULTS.md`](docs/results/RESULTS.md).
+
+**Phase 1 — fused decode attention: substantially complete.** Six kernel
+versions explored (v0 → v5); **v3 lives on `main` at 0.713 ms / 189 GB/s, 1.91×
+faster than PyTorch SDPA** on the reference microbench workload. v4
+(FlashDecoding split-K) and v5 (`cp.async` double-buffering) were explored
+but regressed on this workload — both retained in git history with diagnostic
+writeups in
+[`docs/01-fused-attention-journey.md`](docs/01-fused-attention-journey.md).
+Remaining: direct comparison vs raw `flash_attn` (currently we have it
+indirectly via SDPA), `ncu` profile with locked clocks for the "Cause"
+column in RESULTS.md, stretch goals (tensor-core MMA path, prefill FA-2
+forward kernel).
+
+**Phase 2 — KV-cache compression: next, unblocked.**
