@@ -2808,3 +2808,695 @@ cutting lessons from Phases 1-3 into a single working playbook: when
 you sit down with a new kernel, what questions do you ask first, what
 optimizations do you try first, and what traps recur across kernel
 families.
+
+---
+
+# Part 5 — W4A16 GEMM and the cross-cutting workflow
+
+This part has two halves. **Section A** walks Phase 3 — the W4A16
+quantized matmul, the third major kernel of the project. **Section B**
+distills Parts 1–4 + Phase 3 into a working playbook: when you sit
+down with a new kernel, what to ask, what to measure, what to try.
+
+After Part 5 you should be able to:
+
+1. Walk the v0 → 3c progression of W4A16 GEMM from memory.
+2. Recognise *which* of the recurring traps (redundant-work,
+   more-SMs, more-async-loads, smaller-bytes) is being set up in a
+   given proposal.
+3. Apply the six-question playbook to any new GPU kernel you
+   encounter.
+
+---
+
+## Section A — Phase 3: W4A16 quantized matmul
+
+### 5.1 Why weights are different from KV
+
+Phase 2 compressed the *KV cache*: data that grows with sequence
+length and gets cached across decode steps. Phase 3 compresses the
+*model weights*: a different beast.
+
+| Property              | KV cache (Phase 2)            | Weights (Phase 3)         |
+|-----------------------|-------------------------------|---------------------------|
+| Where the data lives  | HBM, grows with `seqlen`      | HBM, static               |
+| When it's quantized   | At decode time (streaming)    | Once, offline             |
+| Size in Llama 3 8B    | ~128 KiB / token / all layers | ~16 GB total (fp16)       |
+| Read pattern          | Read full cache per decode    | Read whole W per linear   |
+| Reuse                 | Once per decode step          | Once per decode step      |
+
+Weights are HUGE: Llama 3 8B has ~7B parameters in linear layers (QKV
+projections, output projection, MLP up/gate/down). At fp16 that's ~14
+GB — *bigger than the KV cache* at typical context lengths. And every
+decode step reads the entire weight tensor of every linear layer.
+
+So for decode latency, **weight HBM traffic is dominant**. The same
+"memory-bound thesis" from Phase 2 applies, just to a different
+tensor. INT4 weights cut weight HBM bytes 4×; that's potentially up to
+4× faster decode for every linear layer.
+
+The kernel is called a **W4A16 GEMM**: W=weights at 4 bits, A=
+activations at 16 bits (fp16), and "GEMM" is the matmul family. It
+takes fp16 activations and INT4 weights, produces fp16 outputs.
+
+> **Checkpoint 5.1**
+> - Why is "quantize once offline" easier than "quantize every decode
+>   step"? What kind of quality loss does each scheme tolerate?
+> - For Llama 3 8B at fp16, what's larger: the weights or the KV cache
+>   at `batch=8, seqlen_kv=4096`? At `batch=32, seqlen=8192`?
+
+---
+
+### 5.2 W4A16 quantization recipe
+
+This is *exactly* KIVI K's recipe, applied to a weight matrix. Same
+symmetric integer math from §4.2, same per-channel groupwise structure
+from §4.4.
+
+Weight `W : [K, N]` fp16 (where K = in_features, N = out_features in
+the matmul `out[M, N] = act[M, K] · W[K, N]`).
+
+Quantization scheme:
+- **Per-channel groupwise**: one scale per `(group along K, output
+  channel along N)`. Group size = 128 K-positions per group.
+- **4-bit signed**: `qmax = 7`. Values in `[-7, 7]`.
+- **Packed**: 8 nibbles per `uint32` along K. Storage shape
+  `[K/8, N]` int32. Bit `i·4..i·4+3` of position `(k_pack, n)`
+  represents K position `k_pack·8 + i`.
+
+Storage size:
+- fp16 W: `K · N · 2 bytes`.
+- INT4 W: `K · N / 2 bytes` for packed values, plus
+  `n_groups · N · 2 bytes` for fp16 scales. With group_size=128:
+  scales overhead is `≈ 1/128 · fp16 size`. Total: ~0.258× of fp16.
+
+For Llama 3 8B linear layers:
+- attn QKV/O (K=4096, N=4096): 32 MiB fp16 → 8.25 MiB W4A16.
+- MLP up/gate (K=4096, N=14336): 112 MiB fp16 → 28.88 MiB W4A16.
+- MLP down (K=14336, N=4096): 112 MiB fp16 → 28.88 MiB W4A16.
+
+Total Llama 3 8B weight footprint: 14 GB fp16 → ~3.6 GB W4A16. A
+factor of 4 storage reduction.
+
+> **Checkpoint 5.2**
+> Compare the §4.4 KIVI K recipe to the §5.2 W4A16 recipe. List two
+> ways they're the same and one way they differ.
+
+---
+
+### 5.3 The decode-shape GEMM (M=1)
+
+For a decode step, each linear layer multiplies the current token's
+hidden state (shape `[1, K]`) by the weight matrix (shape `[K, N]`)
+to produce one row of output (shape `[1, N]`):
+
+```
+out[0, n] = Σ_k act[0, k] · W[k, n]      for n in 0..N-1
+```
+
+This is technically a GEMM with `M = 1` — but really it's a *gemv*
+(matrix-vector). Tensor Cores want `M, N, K ≥ 16` for efficient MMA;
+at `M = 1` they're underused. **The decode GEMM is memory-bound on
+the weight load**, not compute-bound on the FMAs.
+
+Concrete numbers, MLP up/gate at M=1, fp16:
+- Weight: `K · N · 2 = 4096 · 14336 · 2 = 112 MiB`. Has to come from
+  HBM (or L2 if cached).
+- Compute: `K · N · 2 = 117 M FLOPs`. Trivial — would take microseconds
+  at the 4090's ~83 TFLOPS peak.
+
+cuBLAS fp16 measures 0.134 ms here, of which 0.111 ms (83%) is just
+moving 112 MiB at HBM peak speed. So cuBLAS is *itself* memory-bound
+on weight traffic. The "Phase 3 thesis" — 4× less weight bytes →
+potentially 4× faster — fits cleanly.
+
+> **Checkpoint 5.3**
+> - At M=1, why is the GEMM memory-bound rather than compute-bound?
+> - For the MLP up/gate shape, what's the theoretical minimum time to
+>   read 112 MiB at HBM peak (1008 GB/s)?
+> - What about at the *L2* level (72 MiB cache, much higher bandwidth)?
+>   How does that change the analysis?
+
+---
+
+### 5.4 Phase 3b: naive W4A16 kernel
+
+Block geometry (same template as Phase 1 v3):
+- Grid: `N / BLOCK_N` blocks, where `BLOCK_N = 32` (output columns
+  per block).
+- Block: 32 threads = 1 warp. Each thread owns one output column
+  `n = block_n_base + tid`.
+
+Inner loop per (m, n):
+
+```
+acc = 0
+for g in 0..n_groups:
+    scale = scales[g, n]                                  // fp16 → float
+    for p in 0..packs_per_group:
+        k_pack = g · packs_per_group + p
+        w_uint32 = weight_packed[k_pack, n]                // one LDG.E.32
+        for i in 0..7:                                     // unrolled
+            nibble = sign_extend((w_uint32 << (28 - i·4)) >> 28)
+            k = k_pack · 8 + i
+            acc += act[m, k] · (nibble · scale)
+out[m, n] = (half) acc
+```
+
+The shift-trick sign-extends a 4-bit signed value: shift the nibble
+to bits 28-31, then arithmetic shift right by 28 (which sign-extends
+because the high bit was the sign bit).
+
+Coalescing: across the 32 threads in the warp at iter `k_pack`, they
+load `weight_packed[k_pack, n_base..n_base+31]` — 32 contiguous int32
+= one 128-byte coalesced warp load.
+
+### Result, all M=1 Llama shapes
+
+| Shape (K, N) | cuBLAS fp16 | **3b naive** | Speedup |
+|--------------|------------:|-------------:|--------:|
+| 4096 × 4096 (attn) | 0.047 ms | 0.088 ms | 0.53× (**loss**) |
+| **4096 × 14336 (MLP up)** | 0.134 ms | **0.084 ms** | **1.59× (win)** |
+| 14336 × 4096 (MLP down) | 0.133 ms | 0.284 ms | 0.47× (**loss**) |
+
+One **threshold hit** (MLP up/gate by 1.59×) and two losses.
+
+### Diagnosing the losses with Part 2's framework
+
+The wins are concentrated where:
+- N is large (many blocks → enough grid)
+- K is moderate (4096, not 14336 — shorter per-thread reduction)
+
+The losses correspond to:
+- **4096 × 4096 (attn)**: only `N/BLOCK_N = 128` blocks. With 128 SMs
+  on the 4090, that's ~1 block per SM. Each block has 1 warp, so each
+  SM has 1 warp resident → severe under-occupation. Way below the
+  ~16-24 warps/SM needed for latency hiding.
+- **14336 × 4096 (mlp-down)**: K is 14336, so each thread's
+  serial-FMA loop is 14336 iterations long. Even with reasonable
+  block count, the per-thread work is too sequential. The dependency
+  chain through the inner loop is the bottleneck.
+
+So the 3b kernel:
+- Wins when both grid is large *and* per-thread K is moderate.
+- Loses when either is too small.
+
+The fix from Part 3 we'd reach for: *shorten the per-iter chain* and
+*increase per-block parallelism*. That's 3c.
+
+> **Checkpoint 5.4**
+> - For 3b, what's the per-iter chain inside the inner loop (per
+>   thread)?
+> - Why does N affect grid utilization but K doesn't (in 3b)?
+> - What lesson from Phase 1 v4 applies here, and which doesn't?
+
+---
+
+### 5.5 Phase 3c: K-split across warps + act in shmem
+
+Two structural changes:
+
+**Change 1: Multi-warp block with K split.**
+
+Block grows from 1 warp to 4 warps (128 threads). The output tile
+stays the same — 32 columns, owned by one warp's 32 lanes (each lane
+owns one column).
+
+K is split across the 4 warps:
+- Warp 0 processes `K/4` of the K-reduction for all 32 columns.
+- Warp 1 processes the next `K/4`.
+- ... etc.
+
+After the K loop, each thread has its own partial fp32 accumulator. A
+tiny shmem-based combine sums the 4 partials per column to produce
+the final output:
+
+```
+partials_smem[warp_id · 32 + lane] = local_acc       // each warp writes 32 partials
+__syncthreads()
+if warp_id == 0 && lane < 32:                         // warp 0 sums them
+    total = Σ_w partials_smem[w · 32 + lane]
+    out[block_n_base + lane] = (half) total
+```
+
+The block-wide sync is once per output (not per inner iter, like
+attention had). It's negligible vs the K loop.
+
+**Change 2: `act` cached in shared memory.**
+
+Each block's 4 warps all need the same K-length activation vector.
+We cooperatively load `act[0..K)` into shmem at kernel start (128
+threads × `K/128` elements each), then read from shmem in the inner
+loop. Frees L1 for weight traffic.
+
+For K=4096, that's 8 KiB of shmem. For K=14336, 28 KiB. Both well
+under the 100 KiB/SM cap.
+
+### Why this helps each losing shape
+
+| Shape (K, N) | 3b problem | What 3c fixes |
+|--------------|-----------|---------------|
+| **4096 × 4096** | 128 blocks × 1 warp = 128 warps total | 128 blocks × 4 warps = 512 warps → 4× more SMs busy |
+| **14336 × 4096** | Per-thread K-loop = 14336 iters | K/4 = 3584 iters per thread (each warp gets a quarter) |
+| **4096 × 14336** | Already winning | K reduced 4× per thread anyway → even faster |
+
+### Result
+
+| Shape (K, N) | cuBLAS fp16 | 3b naive | **3c decode** | Speedup over cuBLAS |
+|--------------|------------:|---------:|--------------:|---------:|
+| 4096 × 4096 (attn) | 0.047 ms | 0.088 ms | **0.016 ms** | **2.88×** |
+| **4096 × 14336 (MLP up)** | 0.134 ms | 0.084 ms | **0.019 ms** | **6.97×** |
+| 14336 × 4096 (MLP down) | 0.133 ms | 0.284 ms | **0.045 ms** | **2.96×** |
+
+**All three M=1 shapes clear Phase 3 Target** (2-3× over cuBLAS), with
+MLP up/gate at nearly 7×.
+
+The improvement factorises beautifully:
+
+| Shape | 3b → 3c improvement |
+|-------|--------------------:|
+| 4096 × 4096 | 5.4× (4× more warps × bigger ILP) |
+| 4096 × 14336 | 4.4× (4× more parallelism per block) |
+| 14336 × 4096 | 6.3× (K/4 + 4× more warps) |
+
+> **Checkpoint 5.5**
+> - In 3c, how many threads per block? Per warp? How many warps
+>   participate in each output element?
+> - Why does the multi-warp block help even when the kernel was
+>   *already winning* at one shape (MLP up/gate)?
+> - The 3c improvement over 3b is "uniform" across shapes (5.4× /
+>   4.4× / 6.3×). What does that uniformity tell us about the *kind*
+>   of changes 3c made?
+
+---
+
+### 5.6 Why K-split worked for W4A16 (and failed for attention)
+
+In Phase 1 v4 we tried split-K for *attention*, and it lost (§3.6).
+Here in Phase 3c we use K-split-across-warps for *GEMM*, and it wins
+big. What's different?
+
+The key difference is **the bottleneck of the previous version**:
+
+| Kernel | Previous bottleneck | What K-split does | Result |
+|--------|--------------------|--------------------:|--------|
+| Phase 1 v3 → v4 attention | Chain-bound (warp reduce + softmax + FMA) | Adds blocks; doesn't shorten chain | Loss |
+| Phase 3 3b → 3c GEMM | Mixed (grid undersized at small N AND chain long at large K) | Adds parallelism AND splits per-thread K | Win |
+
+For attention v3, the chain through `K load → warp_reduce_sum →
+softmax → V FMA` was the ceiling. Adding more blocks via split-K
+didn't shorten that chain — every block still had the same per-iter
+chain. So more SMs busy didn't help.
+
+For GEMM 3b, the chain was *just* the K-FMA loop: `weight load →
+unpack → FMA → next`. K-split-across-warps directly shortens this
+chain (each thread does K/4 instead of K iterations). And the
+multi-warp block gives more warps per SM. Both bottlenecks of 3b are
+addressed.
+
+**The general principle**: a pattern's success depends on *whether it
+attacks the actual bottleneck*. Same pattern, different result, based
+on what the kernel's chain looks like.
+
+> **Lesson 5.A**: pattern-recognise the bottleneck before applying a
+> textbook optimization. "Split-K" is a hammer; if your nail is a
+> sync barrier, the hammer doesn't help.
+
+---
+
+### 5.7 Weight cache and the L2 story
+
+3c at MLP up/gate hits **1577 GB/s achieved weight bandwidth** — more
+than HBM peak (1008 GB/s). How is that possible?
+
+L2 cache. The 4090's L2 is 72 MiB. Packed W4A16 weights for MLP
+up/gate are 28.88 MiB — comfortably fitting in L2 once.
+
+On the *first* call, weights load from HBM into L2 (memory-bound on
+HBM). On every *subsequent* call, weights come from L2 (much higher
+effective bandwidth). The bench script ran 100 timed iterations after
+25 warmups; by iter 5 or so, weights are warm in L2.
+
+This is realistic: in production decode, the same weights get read
+hundreds of times per request (once per layer × ~200-500 generated
+tokens). The warm-cache regime is what serving actually sees.
+
+> **Checkpoint 5.7**
+> - The achieved bandwidth of 1577 GB/s for 28.88 MiB weights with
+>   0.018 ms latency works out to "1577 GB/s effective." Is that an
+>   HBM peak measurement or an L2 measurement? Why?
+> - In a realistic chat-serving workload (e.g., 8 users × 500 tokens
+>   per response × 32 layers), how many times does each weight tensor
+>   get read? Why does this matter for cache analysis?
+
+---
+
+### 5.8 Phase 3 lessons
+
+1. **The memory-bound thesis transfers across kernel families.**
+   Attention's KV cache (Phase 2), GEMM weights (Phase 3) — same idea,
+   different tensors. When the bottleneck is HBM traffic on a large
+   read-once-per-iter tensor, fewer bytes = potentially less time.
+
+2. **K-split across warps works for GEMM where it didn't for
+   attention.** Different bottleneck patterns. Always pattern-
+   recognise the *current* kernel's bottleneck before applying a
+   textbook trick.
+
+3. **Shmem-cache per-block reuse.** Phase 2c K scales (per group),
+   Phase 3c activations (per block). Same idea: identify the data
+   that's reused many times within a block, lift it out of HBM.
+
+---
+
+## Section B — The cross-cutting workflow
+
+Now we have all the pieces. When you sit down with a new GPU kernel —
+something you've never seen before — what do you do?
+
+### 5.9 Step 1: Measure the baseline
+
+Before *any* optimization, get the numbers. Three measurements:
+
+1. **Latency**: CUDA-event-timed, 25 warmup + 100 timed iterations,
+   report median. The `benchmark()` helper in this repo handles it.
+2. **Achieved bandwidth**: `bytes_moved / latency`. Compare to:
+   - HBM peak (1008 GB/s on 4090)
+   - L2 peak (~5 TB/s effective)
+   - Useful for memory-bound kernels.
+3. **Achieved compute (FLOPS)**: `ops / latency`. Compare to:
+   - fp16 Tensor Core peak (~330 TFLOPS on 4090)
+   - fp32 CUDA core peak (~83 TFLOPS on 4090)
+   - Useful for compute-bound kernels.
+
+The numbers are useful even without a target — they tell you where
+the time is going.
+
+### 5.10 Step 2: Categorize — bandwidth, compute, or chain?
+
+The diagnostic tree:
+
+```
+Is achieved bandwidth close to HBM peak (or L2 peak)?
+  ├── YES → bandwidth-bound. Levers: smaller bytes, better caching.
+  └── NO → continue.
+
+Is achieved compute close to peak FLOPS?
+  ├── YES → compute-bound. Levers: Tensor Cores, more
+  │          parallelism, fewer ops per result.
+  └── NO → continue.
+
+Neither at peak → CHAIN-BOUND. Levers: shorten the inner-loop chain.
+  This is the most common case in our Phase 1-3 kernels.
+```
+
+The cheap sanity check: **"if we doubled HBM bandwidth (or doubled
+compute), would the kernel run twice as fast?"** If not, it's
+chain-bound — the per-iter dependency chain is gating throughput,
+not the resources.
+
+### 5.11 Step 3: Pick the lever — based on the category
+
+**If bandwidth-bound:**
+- Quantize (fewer bytes per element).
+- Better caching (shmem, L1).
+- Eliminate redundant reads.
+- Vectorize loads (fewer load instructions, same bytes).
+
+Phase 2b INT8 KV cache, Phase 3 W4A16 weights both target this.
+
+**If compute-bound:**
+- Switch to Tensor Cores (fp16 MMA is ~4× CUDA core FLOPS).
+- Reduce ops per result (algorithm change).
+- Vectorize within a warp.
+
+We didn't hit this in Phases 1-3 (all our kernels were memory or chain
+bound), but it's the regime for prefill attention with long prompts.
+
+**If chain-bound:**
+- Shorten the inner-loop critical path. Specific tools:
+  - Remove a `__syncthreads()` if you can preserve correctness.
+  - Move a load OUT of the inner loop (per-group pre-compute).
+  - Reshape a serial reduction to use warp shuffle instead of shmem.
+  - Reduce the cycle count of the chain ops (e.g., fewer `expf`).
+
+Phase 1 v2 (single-sync reduce), Phase 1 v3 (single-warp block),
+Phase 2c (per-group K scales), Phase 3c (K-split across warps) — all
+target this.
+
+### 5.12 Step 4: Predict before you measure
+
+This is the discipline that separates "engineer" from "tinkerer":
+*before* implementing an optimization, predict its effect.
+
+Two predictions:
+
+1. **Direction**: should this make the kernel faster, slower, or
+   neutral?
+2. **Magnitude**: roughly how much? (If the prediction is off by 4×,
+   you're missing something.)
+
+The prediction forces you to articulate *why* the optimization
+helps. If you can't predict, you don't understand the bottleneck.
+
+Common prediction failures from Phases 1-3:
+
+- **Phase 1 v1 naive**: "online softmax = less work = faster." Wrong
+  direction. The diagnosis was incomplete (missed the load-barrier
+  consequence).
+- **Phase 1 v4**: "more SMs = more throughput." Wrong magnitude. The
+  prediction assumed bandwidth-bound; actually chain-bound.
+- **Phase 2b INT8 KV**: "half the bytes = ~2× faster." Wrong magnitude
+  (was 1×). Same chain-bound diagnosis missed.
+
+Each failure was followed by re-diagnosis: *what's the actual
+bottleneck?* And the next attempt got it right.
+
+### 5.13 Step 5: Measure, reconcile, iterate
+
+After implementing:
+
+1. Re-measure all three (latency, bandwidth, compute).
+2. Compare to prediction.
+3. If on target: great, document and commit.
+4. If off: re-diagnose. What did the prediction assume that turned out
+   wrong?
+
+This is the **explore-then-revert pattern** from the project workflow:
+if the optimization didn't help, commit it to a branch with the
+diagnostic write-up (so the lesson is captured), then revert main to
+the previous version. v4 and v5 of attention are examples — both kept
+in git history at branches `v4` and `v5`, neither on main.
+
+The diagnostic write-up is more valuable than the code. The next time
+you face a similar shape, you've already paid for the diagnosis.
+
+### 5.14 Step 6: Pattern-recognise the traps
+
+Four traps that recur (each tied to a Part 3/4 case):
+
+**Trap A — "Redundant work is wasteful."**
+
+SIMT-parallel ALU work is essentially free (§2.4). Lanes in a warp
+execute the same instruction in lockstep. If 31 of them would
+otherwise be idle at a sync, having them do *identical* scalar work
+costs nothing in wall-clock.
+
+Set-up: you see code where every thread computes the same scalar.
+Reaction: "wasteful." Truth: probably free.
+
+**Trap B — "More SMs = more throughput."**
+
+Only if the bottleneck is per-SM compute or per-SM bandwidth. If
+*total* HBM bandwidth is the ceiling, distributing more SMs to read
+from it doesn't help. Same for chain-bound kernels — more SMs means
+each SM still has the same inner-loop chain.
+
+Set-up: kernel runs on few SMs; "let's split-K to fill the GPU."
+Reaction: check whether SM count is *actually* the bottleneck.
+
+**Trap C — "More async loads = more latency hiding."**
+
+`cp.async` and similar give you explicit control over in-flight loads.
+But they go through shmem (the extra hop costs cycles). And nvcc's
+compiler scheduling already inserts prefetches where it can. The win
+is real only when:
+- Per-iter compute is heavy enough to amortize the shmem hop, AND
+- The current load latency is genuinely on the critical path.
+
+Set-up: latency analysis shows lots of "memory stall" cycles.
+Reaction: those stalls might already be hidden by occupancy. Don't
+add shmem hops if it's not helping.
+
+**Trap D — "Smaller bytes = faster kernel."**
+
+Only if the kernel is bandwidth-bound. Phase 2b INT8 KV measures this
+exactly: 2× less bytes, 1× speed (tied). The bytes weren't the
+bottleneck.
+
+The opposite *can* be true: smaller bytes can let you fit more in L2/
+L1, which speeds up the warm-cache regime. Phase 3 W4A16 wins partly
+because 28 MiB packed weights fit in 72 MiB L2 where 112 MiB fp16
+don't.
+
+Set-up: "Quantize → smaller bytes → must be faster." Reaction: depends
+on the bottleneck.
+
+### 5.15 The named patterns (catalog)
+
+Five patterns from Phases 1-3 that you can reach for, with the
+condition when each applies:
+
+**Pattern 1: Scale-folding linearity** (§4.6)
+
+When: a scalar scale appears inside a sum.
+
+What: factor the scalar out: `Σ x · (y · s) = s · Σ x · y`.
+
+Where: INT8 KV attention (`q · k = k_s · q · k_int`); W4A16 (the
+scale at the *output column* level, after per-channel pre-scaling
+of q).
+
+**Pattern 2: Per-group pre-compute** (§4.8)
+
+When: a value is constant within a group of iters but changes between
+groups.
+
+What: lift the computation involving it to a per-group preamble.
+
+Where: INT4 KIVI per-channel K scales (pre-scale q once per group of
+seqlen positions); W4A16 group-wise scales (similar structure).
+
+**Pattern 3: Single-warp block trade** (§3.5)
+
+When: cross-warp sync is on the inner-loop critical path AND you can
+afford to drop occupancy.
+
+What: shrink to 1 warp per block, eliminate `__syncthreads()`, use
+warp shuffle for the cross-thread communication.
+
+Where: Phase 1 v3, all Phase 2 attention kernels.
+
+**Pattern 4: Double-buffered shmem reduce** (§3.4)
+
+When: a cross-warp shmem reduce per iter has 2 syncs (one for the
+write, one for the broadcast).
+
+What: alternate buffers iter-to-iter so iter j+1's write can't clobber
+iter j's read. Pair with "every warp redundantly does the final
+reduce" so the broadcast is via shuffle, not shmem.
+
+Where: Phase 1 v2.
+
+**Pattern 5: K-split across warps** (§5.6)
+
+When: kernel is chain-bound on a long K-reduction AND grid is too
+small to fill the GPU.
+
+What: multi-warp block, K split across warps, tiny shmem combine for
+the per-column partials.
+
+Where: Phase 3c (worked); Phase 1 v4 attempted (didn't work because
+attention's chain wasn't K-reduction-bound).
+
+### 5.16 The six-question checklist
+
+When you sit down with a new GPU kernel:
+
+1. **What's the workload?** Shape of inputs, expected output, target
+   workload (decode shape vs prefill shape, etc.).
+
+2. **What does the kernel look like at the inner loop?** What are the
+   per-iter loads, the per-iter syncs, the per-iter critical path?
+
+3. **What's the baseline?** Latency + achieved bandwidth + achieved
+   compute. Compared to peak HBM, peak compute.
+
+4. **Bandwidth-, compute-, or chain-bound?** Use §5.10's diagnostic
+   tree.
+
+5. **What lever shortens *that* specifically?** Match the category to
+   §5.11's list of levers. Predict the magnitude.
+
+6. **Measure, reconcile, iterate.** If the prediction was wrong, re-
+   diagnose.
+
+This is the working playbook. Every kernel in Phases 1-3 was developed
+by applying these six steps repeatedly. Most failures came from
+skipping step 4 (incorrect categorization) or step 5 (wrong lever for
+the actual bottleneck).
+
+---
+
+## 5.17 Closing
+
+We're 23,000 words and five parts in. The book started from "what
+does attention compute?" and ended at "what do you do when you sit
+down with a new kernel?" Along the way:
+
+- **Part 1**: the math — Q, K, V, softmax, GQA, prefill vs decode, the
+  KV cache.
+- **Part 2**: the hardware — SMs, warps, threads, memory hierarchy,
+  SIMT, occupancy, the dependency chain, the diagnostic framework.
+- **Part 3**: decode attention v0 → v5 — five wins and two reverts,
+  with the bottleneck and lesson articulated at each step.
+- **Part 4**: KV-cache compression — quantization math, KIVI's K vs V
+  asymmetry, the scale-folding linearity trick, the per-group
+  pre-compute trick, the kernel-level vs model-level gap.
+- **Part 5**: W4A16 GEMM and the cross-cutting playbook — multi-warp
+  K-split, the four recurring traps, the five named patterns, the
+  six-question checklist.
+
+### The five lessons one more time
+
+1. **SIMT-parallel ALU is essentially free.** Don't move work to one
+   lane to "save" it if the other lanes were idle.
+
+2. **`__syncthreads()` is a load barrier.** nvcc won't hoist memory
+   loads above it. Manual prefetching matters.
+
+3. **Removing a shmem hop can dwarf removing a sync.** The full
+   consequences of shortening the chain often exceed the sync's own
+   cost.
+
+4. **Occupancy is a means, not an end.** Trade it for shorter chain
+   when the lost warps were idle at syncs.
+
+5. **Don't add parallelism where the bottleneck isn't compute.**
+   Bandwidth-bound parallelism through more SMs doesn't help if HBM
+   is already the shared ceiling.
+
+(Sub-lessons from Phase 2 and Phase 3 are absorbed into the named
+patterns and the trap list.)
+
+### What to do next
+
+You're ready to:
+
+1. **Re-implement v0 → v3 from memory.** Check out branch `v0`, run
+   the tests, study the code, write your own version, validate
+   against the reference.
+
+2. **Walk new kernels using the checklist.** Anything in the
+   `flash-attn` library, `cublas`, or your favorite GPU codebase.
+   Apply §5.16.
+
+3. **Teach it.** Find someone curious and explain Phase 1 v2's
+   single-sync reduce. If you can articulate *why* it wins more than
+   the visible sync removal predicts, you've got the chain-bound
+   mental model.
+
+4. **Read the journey docs** (`docs/0[123]-*-journey.md`) again. The
+   first time they were narrative; the second time they're applied
+   exercises in this part's framework.
+
+The repo's branches are your study path. `v0` through `v5`, `2a`
+through `2d`, `3a` through `3c` — each branch is a self-contained
+state you can build, test, and benchmark. Use them.
+
+---
+
+**Done.** Part 5 is the end of the book.
+
+The framework is yours to take elsewhere — the journey was always
+the framework, not the specific kernels.
