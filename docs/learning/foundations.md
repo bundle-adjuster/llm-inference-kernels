@@ -2104,3 +2104,707 @@ and the structural per-group K-scale trick that makes INT4 actually
 Before continuing, work checkpoints 3.2 (online softmax) and 3.4
 (v2's sync removal) cold. They're the math/structural pair you'll
 extend in Part 4.
+
+---
+
+# Part 4 — KV-cache compression
+
+Phase 1 made the *compute* fast. Phase 2 (the subject of this part)
+shrinks the *memory*: replace fp16 KV cache storage with integer
+storage, dequantizing on the fly inside the attention kernel.
+
+The arithmetic in Part 4 is simpler than Part 3's. The interesting
+work is **structural** — which axis the scale shares values across,
+how the kernel exploits that structure for both *quality* and *latency*,
+and how to validate the choice at the model level (not just the
+kernel level).
+
+By the end of Part 4 you should be able to:
+
+1. Derive symmetric integer quantization (scales, qmax, rounding)
+   from scratch.
+2. Explain why K and V want *different* quantization recipes (KIVI).
+3. Recognise when a structural trick will shorten the per-iter chain
+   — and when it just shrinks bytes without changing the chain.
+4. Set up a model-level perplexity measurement for a new quantization
+   scheme via the `F.scaled_dot_product_attention`-patching trick.
+
+---
+
+## 4.1 The KV-cache problem, deeper
+
+From §1.6: KV cache stores fp16 K and V across decode steps. Per token
+across all layers of Llama 3 8B:
+
+```
+2 · n_layers · n_kv_heads · head_dim · sizeof(fp16)
+= 2 · 32 · 8 · 128 · 2
+= 131,072 B = 128 KiB / token
+```
+
+Scale that up to a chat-serving workload of `batch=32, seqlen=8192`:
+**~34 GiB.** Doesn't fit in a 24 GB RTX 4090 alongside the model
+weights, never mind a larger model.
+
+So the KV cache caps two things in practice:
+- **Memory**: the number of concurrent users × their context length.
+- **Bandwidth**: every decode step reads the full cache. At
+  `batch=8, seqlen_kv=4096`: 128 MiB of K + V *per decode step*.
+
+Phase 2's question: **can we shrink it without breaking quality?**
+
+The implicit second question is whether shrinking it also speeds up
+the attention kernel. Part 1 said decode attention "should be"
+memory-bound; if true, half the bytes ≈ half the time. Part 3 showed
+v3 was actually chain-bound (19% of HBM peak). So the latency answer
+isn't obvious before measuring.
+
+> **Checkpoint 4.1**
+> Why does the KV cache scale with `seqlen` but the weights don't?
+> What does this imply for choosing between weight quantization (Phase
+> 3) and KV-cache quantization (Phase 2) in terms of which problem
+> they solve?
+
+---
+
+## 4.2 Symmetric integer quantization, from scratch
+
+The simplest quantization scheme. Two parameters:
+
+- **Bit width**: 8 (INT8) or 4 (INT4). Determines `qmax = 2^(bits-1) - 1`,
+  the largest representable signed integer. INT8 has `qmax = 127`;
+  INT4 has `qmax = 7`.
+- **Scale axis**: which group of values shares a single scale.
+
+Given a set of fp16 values `x[i]` sharing one scale:
+
+```
+absmax = max(|x[i]|)
+scale  = absmax / qmax            // fp16
+q[i]   = round(x[i] / scale),     // map to int, clamp to [-qmax, qmax]
+         clamped to [-qmax, qmax]
+```
+
+Dequantize:
+```
+x_hat[i] = q[i] · scale
+```
+
+Properties:
+- `|x_hat[i] - x[i]| ≤ scale / 2`  (rounding error is bounded by half
+  a step).
+- Per-element error vs `absmax` is `≤ 1 / (2 · qmax)`. INT8: ~0.4%.
+  INT4: ~7%.
+
+### The outlier problem
+
+Per-element error is *bounded by absmax*. But what if some elements
+are much smaller than absmax?
+
+Example: `x = [-0.05, 0.05, -0.03, 0.04, 2.0]`. The outlier `2.0`
+sets `absmax = 2.0`. INT8 scale = `2.0 / 127 ≈ 0.0157`.
+
+The "normal" value `0.05` quantizes to `round(0.05 / 0.0157) = 3`,
+then dequantizes to `3 · 0.0157 = 0.0471`. Error 0.0029, but as a
+*fraction of 0.05*, that's **6%**. The outlier crushed the resolution
+for everyone else.
+
+This is the **outlier problem**. The scheme is forced to use big steps
+to cover the outlier, and the steps are coarse for non-outlier values.
+
+The fix is to *not* share a scale across values with such different
+magnitudes. Which brings us to §4.3.
+
+> **Checkpoint 4.2**
+> - For INT4 with `qmax = 7`, what's the maximum per-element error as
+>   a fraction of `absmax`?
+> - In the example above, what would the relative error on `0.05` be
+>   if we used INT4 instead of INT8?
+> - The error bound `scale / 2` is *per-element*. Why doesn't that
+>   mean a kernel using these dequantized values has bounded relative
+>   error on the final output? (Hint: think about the dot product.)
+
+---
+
+## 4.3 Per-token vs per-channel: the structural choice
+
+A K (or V) cache tensor has shape `[batch, n_kv_heads, seqlen,
+head_dim]`. For symmetric quantization, **which axis does the absmax
+reduce over** — i.e., which values share a scale?
+
+Two options:
+
+**Per-token**: one scale per `(batch, kv_head, token)`. The absmax
+reduces over `head_dim` (128 values per scale). Scale shape:
+`[batch, n_kv_heads, seqlen]`.
+
+**Per-channel** (groupwise along seqlen): one scale per
+`(batch, kv_head, group, channel)`. Groups partition the seqlen axis
+in chunks of `group_size = 32` tokens. The absmax reduces over the
+`group_size` tokens within the group, *per channel*. Scale shape:
+`[batch, n_kv_heads, n_groups, head_dim]`.
+
+**Trade-off:**
+
+| Scheme | Values per scale | Storage of scales |
+|--------|------------------|-------------------|
+| Per-token | 128 (one head_dim) | 1 fp16 per token |
+| Per-channel groupwise (g=32) | 32 (one group of tokens) | 128 fp16 per group |
+
+Both have small scale storage. The real question is *quality* — which
+direction has more variation in magnitudes, and therefore *which one
+needs the per-axis flexibility*?
+
+If magnitudes vary mostly **between tokens** (and within a token,
+head_dim values are similar): per-token is right.
+
+If magnitudes vary mostly **between channels** (and within a channel,
+many tokens have similar magnitudes): per-channel is right.
+
+This is an empirical question about the data, not a math question.
+
+> **Checkpoint 4.3**
+> - For per-channel groupwise quantization with `group_size = 32` and
+>   `seqlen = 4096`, how many groups are there?
+> - You're told that for some tensor, the magnitudes vary *both*
+>   between tokens AND between channels. Which scheme is better, or
+>   should you do both (per-token-per-channel)?
+
+---
+
+## 4.4 KIVI's two findings
+
+KIVI (Liu et al. 2024) measured the K and V activations of real LLMs
+and found:
+
+1. **K has persistent per-channel outliers.** Certain `head_dim`
+   positions consistently have much larger magnitudes than others,
+   across all tokens. These outlier channels stay outlier-ish across
+   the whole sequence.
+
+2. **V doesn't.** V's magnitudes are roughly uniform across `head_dim`.
+
+The recipe that falls out of these two measurements:
+
+| Tensor | Scale axis | Reason |
+|--------|------------|--------|
+| K | Per-channel groupwise | Outlier channels each get their own scale; non-outlier channels aren't crushed. |
+| V | Per-token | head_dim values within a token are uniform; one scale per token wastes nothing. |
+
+At **INT8**, this distinction barely matters — INT8's resolution
+(`qmax = 127`) is fine enough that either scheme works. The K-outlier
+crushing of non-outlier channels (from §4.2's analysis) costs maybe a
+percent or two of element-level accuracy, which softmax washes out.
+
+At **INT4** (`qmax = 7`), the K-outlier crushing becomes catastrophic.
+Per-token K at INT4 leaves only a few representable values for the
+non-outlier channels, and the model quality degrades sharply.
+
+KIVI's contribution: **at INT4, per-channel K is the difference
+between "essentially indistinguishable" and "noticeable degradation"**.
+We measured this directly in Phase 2d (see §4.10).
+
+> **Checkpoint 4.4**
+> If we tried per-channel V instead of per-token V (both at INT4),
+> would you expect quality to be better, worse, or about the same as
+> KIVI's per-token V? Why?
+
+---
+
+## 4.5 Phase 2b: INT8 implementation
+
+Storage layout:
+- `K_q : [batch, n_kv_heads, seqlen, head_dim]` int8.
+- `K_scale : [batch, n_kv_heads, seqlen]` fp16. One scale per token.
+- Same for `V_q` and `V_scale`.
+
+Compared to fp16 KV (2 B per element), this is 1 B per element + ~0.78%
+scale overhead — **0.51× the fp16 size**.
+
+The CUDA kernel reads `K_q` (int8) and `K_scale` (fp16) directly from
+HBM, dequantizes in registers, and proceeds with v3's attention math.
+
+### Naive dequant: per-lane multiply
+
+The straightforward approach:
+
+```
+for j in 0..seqlen_kv:
+    // 4 ints per thread, plus per-token scale
+    k_int[0..3] = K_q[j, tid*4..tid*4+3]
+    v_int[0..3] = V_q[j, tid*4..tid*4+3]
+    k_s         = K_scale[j]       // fp16 → float
+    v_s         = V_scale[j]
+
+    // Per-lane dequant (4 multiplies)
+    k_v[0..3] = k_int[0..3] · k_s
+    v_v[0..3] = v_int[0..3] · v_s
+
+    // Then v3's attention body:
+    partial = q.x·k_v[0] + q.y·k_v[1] + q.z·k_v[2] + q.w·k_v[3]
+    ... warp reduce + softmax + V FMA ...
+```
+
+This works. But there's an elegance available.
+
+---
+
+## 4.6 The scale-folding linearity trick
+
+Look at the K dot product:
+
+```
+q · k = Σ_d q[d] · k[d]
+      = Σ_d q[d] · (k_int[d] · k_s)
+      = k_s · Σ_d q[d] · k_int[d]      // pull the scalar k_s out
+```
+
+The K scale is *one value per token* — a scalar, the same for all
+`d`. We can factor it out of the sum. Compute the dot product on
+int-valued `k_int`, do one multiply by `k_s` at the end.
+
+For V, the FMA is:
+
+```
+o[d] += p_j · v[d]
+      = p_j · (v_int[d] · v_s)
+      = (p_j · v_s) · v_int[d]
+```
+
+Same trick: fold `v_s` into `p_j` once per iter, then FMA with
+`v_int` directly.
+
+The refactored inner loop:
+
+```
+for j in 0..seqlen_kv:
+    k_int = K_q[j, tid*4..tid*4+3]
+    v_int = V_q[j, tid*4..tid*4+3]
+    k_s   = K_scale[j]
+    v_s   = V_scale[j]
+
+    partial    = q.x·k_int[0] + q.y·k_int[1] + q.z·k_int[2] + q.w·k_int[3]
+    partial    = warp_reduce_sum(partial)
+    s_j        = partial · k_s · softmax_scale       // fold K scale here
+
+    m_new      = max(m_state, s_j)
+    α          = exp(m_state - m_new)
+    p_j        = exp(s_j - m_new)
+    p_j_scaled = p_j · v_s                            // fold V scale here
+
+    o_state.x += p_j_scaled · v_int[0]
+    o_state.y += p_j_scaled · v_int[1]
+    ... (with α-rescale on o_state, l_state, m_state) ...
+```
+
+**Saves 8 multiplies per iter** vs the naive per-lane dequant (4 K
+dequant + 4 V dequant multiplies, replaced by 1 K-side fold + 1
+V-side fold).
+
+This linearity-folding trick depends on the scale being a *scalar*
+across the axis you're summing over. **It works for per-token scales.
+It would NOT work for per-channel scales** (§4.8 explains).
+
+> **Checkpoint 4.6**
+> - Re-derive the linearity factoring for K from scratch. Where does
+>   the scalar property of `k_s` get used?
+> - For the V FMA fold, why is `p_j` also a scalar (across `d`)?
+> - In Phase 1 v3 (no quantization), is there a "scale" the same
+>   linearity could fold? (Hint: yes — what's `softmax_scale`?)
+
+---
+
+## 4.7 Why INT8 tied with v3 — the chain doesn't move
+
+INT8 attention measured: **0.713 ms — exactly tied with v3 fp16.**
+
+Naively this is surprising: INT8 reads *half* the KV bytes, so if v3
+were bandwidth-bound, INT8 should be ~2× faster.
+
+Using Part 2's framework:
+
+**Was v3 bandwidth-bound?** §3.5 showed v3 hits 189 GB/s of 1008 GB/s
+peak (19%). Not at peak. INT8 attention hits 96 GB/s (half the bytes
+in the same time). Also not at peak. **Neither is bandwidth-bound.**
+
+**So what is the bottleneck?** The per-iter chain (from §3.5):
+
+```
+load K → warp_reduce_sum → softmax (max + 2× exp) → V FMA → next iter
+```
+
+This shape is *the same* in v3 and INT8. The K load is smaller in
+INT8, but the load is one step in the chain; making it shorter (a few
+cycles) doesn't change the chain's total latency much. The
+warp_reduce_sum, softmax, and FMA are unchanged. Same chain = same
+per-iter time = same wall-clock.
+
+**The lesson is fundamental, and recurs**: changing the bytes without
+changing the per-iter chain doesn't change latency on a chain-bound
+kernel. Same as Phase 1 v4 (split-K), Phase 1 v5 (cp.async). Different
+levers (more SMs, more in-flight loads, smaller bytes) — same
+diagnosis (chain didn't move, so latency didn't either).
+
+But INT8 is still a **memory** win. 0.51× of fp16 KV means roughly:
+- ~2× longer context in the same VRAM, or
+- ~2× larger batch.
+
+And Δppl on WikiText-2 is +0.0008 — essentially lossless (§4.10).
+
+So INT8 KV is a no-brainer drop-in for serving stacks: same speed,
+half the memory, no quality loss. The wins come from infrastructure
+(more users / longer context) not the kernel-step latency.
+
+> **Checkpoint 4.7**
+> - For a kernel that's *truly* bandwidth-bound (≈ 1008 GB/s on the
+>   4090), would INT8 KV speed it up? By roughly how much?
+> - State, in one sentence, the lesson that recurs across Phase 1 v4,
+>   Phase 1 v5, and Phase 2b.
+
+---
+
+## 4.8 Phase 2c: INT4 KIVI
+
+Storage layout (packed):
+- `K_q : [batch, n_kv_heads, seqlen, head_dim/2]` int8, 2 nibbles
+  per byte.
+- `K_scale : [batch, n_kv_heads, n_groups, head_dim]` fp16. *Per-
+  channel groupwise* — one scale per `(group, channel)`.
+- `V_q : [batch, n_kv_heads, seqlen, head_dim/2]` int8, packed.
+- `V_scale : [batch, n_kv_heads, seqlen]` fp16. *Per-token*.
+
+This is **0.27× of fp16** — 4× smaller storage on the values, plus
+small per-group K-scale overhead and tiny V-scale overhead.
+
+The kernel's job: read packed bytes, unpack (one int8 byte → 2 signed
+4-bit values via the shift-trick from Part 3 / Phase 3 work), dequantize
+with the right scale, do attention.
+
+### Why the §4.6 trick doesn't apply directly
+
+The K dot product, with per-channel K scales:
+
+```
+q · k = Σ_d q[d] · k[d]
+      = Σ_d q[d] · (k_int[d] · k_scale[g, d])    // k_scale indexed by d!
+```
+
+Now `k_scale[g, d]` is *inside* the sum (depends on `d`), so we can't
+factor it out. Per-lane dequant is back — 4 multiplies per thread per
+iter just for K dequantization.
+
+That's bad. We expected INT4 to win on memory; this kernel-cost story
+makes the latency outlook worse, not better.
+
+### The structural trick: per-group pre-scaling
+
+But: `k_scale[g, d]` is **constant within a group**. For all iters
+`j` such that `g(j) = g`, the K scale is the same. So instead of
+loading the K scale per iter, we can:
+
+1. **Outer-loop over groups** `g = 0..n_groups - 1`.
+2. **Per-group preamble**: load all 4 K scales for this thread's lanes
+   into registers. Then *pre-scale q*:
+   ```
+   q_scaled.x = q.x · k_scale[g, tid*4]
+   q_scaled.y = q.y · k_scale[g, tid*4+1]
+   q_scaled.z = q.z · k_scale[g, tid*4+2]
+   q_scaled.w = q.w · k_scale[g, tid*4+3]
+   ```
+   That's 4 multiplies, once per group.
+
+3. **Inner loop over tokens within the group**: the K dot product is
+   now
+   ```
+   q_scaled · k_int = Σ_d q_scaled[d] · k_int[d]
+                    = Σ_d (q[d] · k_scale[g, d]) · k_int[d]
+                    = Σ_d q[d] · k_int[d] · k_scale[g, d]
+                    = q · (k_int · k_scale) = q · k          ✓
+   ```
+   Correct, but now the inner loop is just `int_value`s and pre-scaled
+   `q_scaled`. **No per-iter K-scale load. No per-iter K dequant.**
+
+The amortized cost of the per-group preamble: 4 multiplies per group ÷
+`group_size = 32` iters per group = **0.125 multiplies per iter** for
+the K dequant. Down from 4 per iter (naive per-lane).
+
+For V (per-token), the scale-folding §4.6 trick still works: `p_j ·
+v_s` folds into the FMA coefficient.
+
+The full inner loop:
+
+```
+for g in 0..n_groups:
+    // Per-group preamble: load 4 K scales, pre-scale q (in registers)
+    k_scale_v = K_scale[g, tid*4..tid*4+3]        // 4 fp16 → float
+    q_scaled.x = q.x · k_scale_v.x
+    q_scaled.y = q.y · k_scale_v.y
+    q_scaled.z = q.z · k_scale_v.z
+    q_scaled.w = q.w · k_scale_v.w
+
+    for j in g·group_size..(g+1)·group_size:
+        // Load packed int4 K and V (one uint16 per thread → 4 nibbles)
+        k_int[0..3] = unpack(K_q[j, tid*2..tid*2+1])
+        v_int[0..3] = unpack(V_q[j, tid*2..tid*2+1])
+        v_s         = V_scale[j]                   // per-token V scale
+
+        partial    = q_scaled.x·k_int[0] + q_scaled.y·k_int[1] + ...
+        partial    = warp_reduce_sum(partial)
+        s_j        = partial · softmax_scale       // K scale already folded!
+
+        m_new      = max(m_state, s_j)
+        α          = exp(m_state - m_new)
+        p_j        = exp(s_j - m_new)
+        p_j_scaled = p_j · v_s
+
+        o_state += p_j_scaled · v_int              // FMA on ints
+        // ... rest of softmax update ...
+```
+
+The per-iter chain has lost the K-scale load (every iter). It also has
+shorter K and V loads (uint16 vs uint32) because of the packed format.
+
+> **Checkpoint 4.8**
+> - Why was it crucial that `k_scale[g, d]` is constant within a group
+>   for the pre-scale-q trick to work?
+> - Per-iter, how many multiplies for K dequant in the naive INT4 kernel
+>   vs the per-group-pre-scaled version? Amortise.
+> - The trick wouldn't work for *per-token* K scales (one per token).
+>   Why? (Hint: how often does the scale change?)
+
+---
+
+## 4.9 Why INT4 sped up where INT8 tied
+
+INT4 KIVI measured: **0.554 ms — 1.29× faster than v3 / INT8.**
+
+Apply Part 2's framework: did the **chain** change? Let's compare
+inner loops:
+
+| Element                             | INT8 per-token | INT4 KIVI |
+|-------------------------------------|----------------|------------|
+| Load K_q                            | 4 B (LDG.E.32) | 2 B (LDG.E.16) |
+| Load K_scale                        | **1× fp16 / iter** | **0** (cached per-group) |
+| Load V_q                            | 4 B | 2 B |
+| Load V_scale                        | 1× fp16 / iter | 1× fp16 / iter |
+| K dequant in inner loop             | "fold via dot" (1 multiply post-reduce) | none (pre-scaled q) |
+| V dequant fold (p_j scale)          | 1 multiply | 1 multiply |
+| Warp reduce + softmax + FMA         | identical | identical |
+
+The big change: **INT4 KIVI has one fewer load on the per-iter critical
+path** (the K scale). Also two of the loads (K_q and V_q) are half the
+size.
+
+Loads on the chain are *latency-bearing* (the value has to come back
+before the dot product can complete). Removing a load shortens the
+chain proportionally to that load's contribution to the chain — likely
+~10-30 cycles per iter at HBM/L2 hit times. Times 4096 iters times
+many parallel blocks: real wall-clock.
+
+So INT4 KIVI moves the chain in a way INT8 didn't. INT8 just shrank
+bytes; INT4 KIVI shrank bytes **and** removed a load from the inner
+loop.
+
+**The lesson, made explicit**: byte-shrinking changes alone don't help
+chain-bound kernels. Byte-shrinking changes that *also* lift loads out
+of the inner loop do.
+
+And so we land at: **INT4 KIVI is 0.27× memory and 1.29× latency over
+fp16 v3.** Wins both axes.
+
+> **Checkpoint 4.9**
+> - Explain in one sentence why INT8 tied with v3 but INT4 KIVI beat
+>   it, using the word "chain."
+> - If we had INT4 with *per-token* K scales (no KIVI), would the
+>   per-group pre-scale-q trick apply? Would the kernel be faster than
+>   INT8?
+
+---
+
+## 4.10 Phase 2d: measuring perplexity
+
+We've built kernels. The kernel-level error vs the fp16 reference is
+small (max abs diff: 1.1e-3 for INT8, 2.3e-2 for INT4 — see §4.5,
+§4.8). But the **model-level** quality is what matters: when Llama 3
+generates text reading the compressed cache, how much worse is the
+output?
+
+The standard metric is **perplexity** on a held-out dataset (we use
+WikiText-2 test, 131,008 tokens across 64 chunks of 2048):
+
+```
+perplexity = exp(- 1/N · Σ log p_model(token_i | tokens_<i))
+```
+
+Lower is better. The Phase 2 success criteria from `docs/02`:
+- INT8: Δppl < 0.2 (essentially indistinguishable threshold).
+- INT4 KIVI: Δppl < 0.5 (acceptable target).
+
+### The patch-`F.scaled_dot_product_attention` trick
+
+To measure this, we need Llama 3 8B's attention to *use the
+quantized KV cache* during a 64-chunk forward pass.
+
+A real model integration (Phase 4 work) needs a custom attention
+class that allocates an INT8 or INT4 KV cache. Substantial lift.
+
+A **clever proxy** that's mathematically equivalent: patch the
+`torch.nn.functional.scaled_dot_product_attention` entry point. The
+Llama attention layer calls `F.scaled_dot_product_attention(Q, K, V)`
+internally. We intercept that call, quantize the `K` and `V` inputs
+with our reference, dequantize them back to fp16, and pass the
+*noisy fp16 values* into the original `F.sdpa`.
+
+```python
+def patched_sdpa(query, key, value, ...):
+    # Quantize K with KIVI's per-channel groupwise (or per-token int8)
+    key_q   = quantize_kivi_int4(key)
+    value_q = quantize_per_token_int4(value)
+    # Dequantize back
+    key_back   = dequantize(key_q)
+    value_back = dequantize(value_q)
+    # Call original SDPA with the round-tripped (noisy) K, V
+    return original_sdpa(query, key_back, value_back, ...)
+
+torch.nn.functional.scaled_dot_product_attention = patched_sdpa
+```
+
+The model sees fp16 K, V at the SDPA boundary — but those are *the same
+fp16 values* it would see if the real INT4 KV cache were in use and
+our CUDA kernel were doing the dequant. The kernels and the patched
+sdpa implement the same math:
+
+```
+attention_output = softmax(Q · dequant(K_q)^T / √d) · dequant(V_q)
+```
+
+They differ in *where* the dequant happens (fused inside the kernel vs
+upfront in patched sdpa), not in the values flowing through softmax.
+
+### Results
+
+| Mode                                   | ppl   | Δppl from fp16 | Threshold | Verdict |
+|----------------------------------------|-------|----------------|-----------|---------|
+| fp16 baseline                          | 7.055 | —              | —         | — |
+| INT8 per-token K, V                    | 7.056 | +0.0008        | < 0.2     | ✅ |
+| INT4 per-token K, V (naive, no KIVI)   | 7.517 | +0.462         | —         | (KIVI comparator) |
+| **INT4 KIVI** (per-channel K, per-token V) | **7.252** | **+0.196** | **< 0.5** | **✅** |
+
+Two key results:
+
+1. **INT8 is essentially lossless** (Δppl = +0.0008 on 131k tokens).
+   The K-outlier crushing predicted by §4.2 just isn't a big deal at
+   INT8's resolution.
+
+2. **At INT4, KIVI matters enormously.** Naive INT4 per-token K → Δppl
+   +0.462 (would barely pass the threshold). KIVI per-channel K → Δppl
+   +0.196 (passes with margin). **KIVI's contribution: 2.36×
+   improvement in quality.**
+
+The §4.4 prediction — that per-channel K matters at INT4 specifically
+— is *measured*.
+
+> **Checkpoint 4.10**
+> - Why does the patched SDPA give the *same numbers* you'd get from
+>   running the actual INT4 KIVI CUDA kernel through Llama? (Hint:
+>   what's the math both paths implement?)
+> - At INT8, naive per-token K (not KIVI) would presumably also work.
+>   Did we measure it? Why or why not? (Hint: design choice.)
+
+---
+
+## 4.11 The kernel-level vs model-level accuracy gap
+
+Phase 2c reported INT4 KIVI's kernel-level *mean relative error* on
+random gaussian K, V as **42%**. Yet on a real Llama model, Δppl is
++0.196 — that's about **2.78% relative perplexity change**. A gap of
+~15×.
+
+What gives?
+
+1. **Softmax max-subtraction is forgiving.** Attention's output is
+   `Σ_j p_j · V[j]`. The softmax assigns most of the weight to a few
+   high-score tokens; the rest have tiny `p_j` and contribute
+   negligibly. So per-element errors on `V` mostly cancel — only the
+   high-`p_j` tokens shape the output. And of those, the *ranking* of
+   scores matters more than absolute magnitudes. Small quantization
+   noise rarely flips ranking.
+
+2. **Real LLM activations have structure.** Random gaussian K, V is
+   the *worst case* — every channel has comparable magnitude, no
+   sparsity to exploit. Real Llama K activations have persistent
+   per-channel outliers (the entire reason KIVI uses per-channel K).
+   With KIVI's per-channel scales, outliers get their own scale and
+   the non-outlier channels are quantized fine. This is exactly the
+   scenario KIVI is *designed for*.
+
+3. **The model can absorb noise.** Llama 3 8B has 32 transformer
+   layers. Each layer's LayerNorm + subsequent attention/MLP can
+   smooth out small perturbations. A 1% error in one layer's
+   activations rarely propagates to a 1% error in the next layer's
+   output.
+
+> **Lesson 4.A**: kernel-level error on random data is a *smoke test*,
+> not a quality verdict. Always validate at the model level on real
+> activations.
+
+This applies to any quantization or numerically-different kernel — not
+just KV cache.
+
+---
+
+## 4.12 Summary of Part 4
+
+| Step | Storage | Latency | Δppl WikiText-2 | Lesson |
+|------|--------:|--------:|----------------:|--------|
+| fp16 KV (v3) | 128.0 MiB | 0.713 ms | 0 | baseline |
+| INT8 per-token | 65.0 MiB (0.51×) | 0.713 ms (tied) | +0.0008 (lossless) | bytes ↓, chain same → latency same; memory free |
+| INT4 KIVI | 34.5 MiB (0.27×) | **0.554 ms (1.29× faster)** | **+0.196 (within 0.5)** | per-group scale lift + smaller loads shorten chain |
+| INT4 per-token (naive) | similar | — | +0.462 | KIVI's per-channel K is worth 2.36× quality |
+
+## 4.13 Five lessons to carry forward
+
+1. **The outlier problem motivates the scale axis.** Symmetric
+   quantization with a shared scale is forced to use coarse steps if
+   any value in the group is an outlier. The non-outlier values get
+   crushed. *Pick the scale axis where magnitudes vary least.*
+
+2. **K and V want different recipes.** K has per-channel outliers; V
+   doesn't. Per-channel K + per-token V (KIVI) is not aesthetic — it's
+   what the data wants.
+
+3. **The scale-folding linearity trick works only for scalar scales.**
+   For per-token scales (one fp16 across head_dim), the scale factors
+   out of the dot product. For per-channel scales, it doesn't — but
+   you can fold *q* instead, once per group.
+
+4. **Byte-shrinking alone doesn't speed up chain-bound kernels.** This
+   is the deepest lesson of Phase 2 — and the same lesson as Phase 1
+   v4/v5. INT8 KV shrank bytes 2× but tied with v3 because the chain
+   didn't move. INT4 KIVI shrank bytes 4× *and* lifted K-scale loads
+   out of the inner loop — the chain moved, and latency dropped 1.29×.
+
+5. **Kernel-level error on synthetic data overstates model-level
+   quality cost.** INT4 KIVI's 42% kernel-level rel err became 2.78%
+   model-level Δppl. Softmax max-subtraction + real-activation
+   structure + multi-layer noise absorption all save you. Don't gate
+   quantization decisions on synthetic-data error alone.
+
+## Closing
+
+We're 17,000 words into the book. Parts 1–4 cover the *kernel
+journeys*; what remains is the **cross-cutting workflow** — how to
+apply Parts 1–4's framework to a *new* kernel you've never seen. That's
+Part 5.
+
+Before continuing, work checkpoints 4.4 (KIVI K/V asymmetry), 4.8
+(per-group pre-scale trick), and 4.9 (why INT4 moved the chain) cold.
+Those three are the load-bearing pair-ups for Part 5 patterns.
+
+---
+
+**Ready for Part 5?** Part 5 (the closing part) pulls the cross-
+cutting lessons from Phases 1-3 into a single working playbook: when
+you sit down with a new kernel, what questions do you ask first, what
+optimizations do you try first, and what traps recur across kernel
+families.
