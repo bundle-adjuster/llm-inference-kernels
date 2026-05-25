@@ -285,7 +285,86 @@ What to look at in the output:
 
 ---
 
-## 4. Common gotchas
+## 4. Phase 3 — W4A16 quantized matmul (branches `3a` → `3c`)
+
+Each sub-step lives on its own branch:
+
+```bash
+git checkout 3<a/b/c>
+python setup.py build_ext --inplace
+```
+
+`main` carries the full Phase 3c decode-optimized kernel.
+
+### What to expect, per sub-step
+
+| Branch  | Commit    | What's new                                                                |
+|---------|-----------|---------------------------------------------------------------------------|
+| `3a`    | `b95872f` | PyTorch reference: W4A16 quantize+dequant+matmul + 17 tests               |
+| `3b`    | `85f8409` | Naive CUDA W4A16 GEMM — one warp per output tile of 32 cols, outer-M loop |
+| `3c`    | `1bbae49` | Decode-optimized: 4-warp blocks, K split across warps, act in shmem       |
+
+### What to run
+
+```bash
+# 3a — reference + correctness only (no extension build needed)
+pytest tests/test_quant.py            # 17 tests (3a) or 24 (3b/3c)
+
+# 3b / 3c — CUDA W4A16 GEMM
+pytest tests/test_quant.py            # 24 tests pass on both branches
+python benchmarks/bench_w4a16.py      # M-sweep × 3 Llama shapes vs cuBLAS
+```
+
+### What to expect
+
+On Llama 3 8B layer shapes at M=1 (decode), `bench_w4a16.py` prints:
+
+| Shape (K, N)         | fp16 cuBLAS | 3b naive   | 3c decode  |
+|----------------------|------------:|-----------:|-----------:|
+| 4096 × 4096 (attn)   | 0.047 ms    | 0.088 ms (loss) | **0.016 ms · 2.88×** |
+| 4096 × 14336 (MLP up)| 0.134 ms    | 0.084 ms (1.59×) | **0.019 ms · 6.97×** |
+| 14336 × 4096 (MLP dn)| 0.133 ms    | 0.284 ms (loss) | **0.045 ms · 2.96×** |
+
+### What to look for, per sub-step
+
+**`3a`** — read `reference/quant_matmul_ref.py`. Symmetric INT4
+per-channel groupwise; matches Phase 2c's KIVI K-side math but applied
+to a `[K, N]` weight matrix. The Python `pack_int4_along_k` helper
+builds the `[K/8, N] int32` packed layout the CUDA kernel reads.
+
+**`3b`** — read `kernels/quant/quant_matmul.cu`. The naive kernel
+already hit Phase 3 *Threshold* (M=1, K=4096, N=14336: 1.59× over
+cuBLAS). The interesting bits:
+- The shift-trick sign-extend: `(int32)(w_packed << (28 - i*4)) >> 28`
+  unpacks one nibble from a packed uint32. Arithmetic right shift in
+  PTX sign-extends; works in 4 cycles per nibble.
+- Coalescing: at iter `k_pack`, the 32 lanes load
+  `weight_packed[k_pack, n_base..n_base+31]` — 32 contiguous int32 =
+  one 128-byte warp-wide coalesced load.
+- The two M=1 *losses* (attn-square and mlp-down) tell us what 3c needs
+  to address.
+
+**`3c`** — same file, separate `w4a16_gemm_decode_kernel` function.
+The structural changes:
+- 4-warp block (128 threads) per output tile of 32 columns. Each
+  warp's 32 lanes own the same 32 columns; K is split 4-way across
+  the warps.
+- After the K loop, a tiny `partials_smem[WARPS × BLOCK_N]` reduction
+  sums the 4 per-warp partials per column.
+- `act` loaded into shmem cooperatively at kernel start (8 KiB for
+  K=4096, 28 KiB for K=14336).
+- Launcher dispatches: `M == 1` → decode kernel; `M > 1` → 3b naive
+  fallback.
+
+Read the 3b → 3c improvement story in the Phase 3 journey doc —
+the win factorises cleanly across the three shapes (5.4× / 4.4× / 6.3×
+improvement over 3b) because the two changes (K-split + shmem) attack
+two different bottlenecks (sequential K work; SM under-occupation at
+small N) that affect the three shapes differently.
+
+---
+
+## 5. Common gotchas
 
 **After `git checkout <branch>`, always rebuild**:
 ```bash
@@ -321,7 +400,7 @@ will need touching.
 
 ---
 
-## 5. Where to go from here
+## 6. Where to go from here
 
 - The **journey docs** are where the *why* lives. Each step's
   measurement is in RESULTS.md; the diagnosis is in the journey doc.

@@ -80,7 +80,63 @@ Use real Llama 3 8B layer shapes:
 - Dettmers et al., *LLM.int8()* (2022)
 - NVIDIA CUTLASS — mixed-input GEMM
 
-## Findings (fill in as you go)
+## Findings
 
-_Decode shape `M=1`: ___× over cuBLAS, ___% of Marlin._
-_M-sweep crossover point: ___._
+The full narrative — theory, design choice, measured result, lesson per
+sub-step (3a reference → 3b naive → 3c decode-optimised → 3d wrap) —
+lives in [`03-quantized-matmul-journey.md`](03-quantized-matmul-journey.md).
+The per-step quantitative table lives in
+[`results/RESULTS.md`](results/RESULTS.md).
+
+**Headline state on `main`:** Phase 3 *Target* hit on all three Llama
+3 8B M=1 layer shapes.
+
+| Shape (K, N)    | M=1 cuBLAS | **3c decode** | Speedup |
+|-----------------|-----------:|--------------:|--------:|
+| 4096 × 4096 (attn QKV / O)    | 0.047 ms | **0.016 ms** | **2.88×** |
+| **4096 × 14336 (MLP up/gate)**| 0.134 ms | **0.019 ms** | **6.97×** |
+| 14336 × 4096 (MLP down)        | 0.133 ms | **0.045 ms** | **2.96×** |
+
+The 3b → 3c jump (2.88×–6.97×, depending on shape) came from two
+combined changes:
+
+1. **Multi-warp block + K split across warps** — 4 warps per block
+   (vs 1 in 3b), with K split 4-way across them and a tiny shmem
+   combine at the end. Addresses both the "long sequential K" loss
+   (mlp-down) and the "SM under-occupation at small N" loss
+   (attn-square) in one structural change.
+2. **`act` in shared memory** — cooperative load once per block,
+   frees L1 for weight traffic.
+
+Both changes are pure additions (no trade-offs against other shapes),
+which is why the improvement over 3b is so uniform across shapes
+(5.4× / 4.4× / 6.3×).
+
+Key lessons from this phase (each tied to a sub-step in the journey doc):
+
+1. **"Memory-bound" thesis carries across kernel families.** The
+   W4A16 win on Llama linear layers is the same pattern as Phase 1
+   attention's "find the workload where bandwidth is the ceiling and
+   exploit smaller bytes."
+2. **K-split across warps works where attention's didn't.** Phase 1
+   v4's split-K lost because attention's per-iter dependency chain
+   was the actual ceiling. GEMM's K-loop has no such chain — K-split
+   converts purely.
+3. **Multi-warp blocks pay when there's K-side compute to split.**
+   3c's K-split + 3b's M-loop are the same "move work out of the
+   inner serial loop" idea applied to different axes.
+4. **Shmem-cache the data that's reused per-block.** L1 was already
+   catching `act` reuse across the warp; explicit shmem caching
+   freed L1 for the new bottleneck (weight reads).
+5. **L2 effectiveness is real.** Warm-cache W4A16 hits 1577 GB/s
+   "effective bandwidth" on MLP up/gate because 28.88 MiB packed
+   weights fit in the 72 MB L2. Realistic decode regime.
+
+**Not measured (deferred):**
+
+- Marlin head-to-head (docs/03 *Target* "within 25% of Marlin").
+- GPTQ / AWQ quantisation + perplexity on real Llama 3 8B weights.
+- Tensor Core MMA path for prefill (M ≥ 16) — stretch.
+- M > 1 fast path (M-fast inner loop). Currently M > 1 falls back to
+  the 3b naive kernel via the launcher; the proper batched-decode
+  variant is a Phase 4 integration concern.

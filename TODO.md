@@ -97,15 +97,20 @@ INT8 ✓ 0.0008; Δppl < 0.5 for INT4 KIVI ✓ 0.196).
 
 ## Phase 3 — Quantized matmul  (design doc: `docs/03-quantized-matmul.md`)
 
-- [ ] Reference: W4A16 quantize + dequant-and-matmul in PyTorch
-- [ ] Naive CUDA W4A16 GEMM: unpack INT4, dequant in registers, accumulate
-- [ ] `tests/test_quant.py`: correctness vs reference
-- [ ] Optimize: group-wise scales, shared-memory staging, vectorized unpack
-- [ ] Tensor Core path for compute-bound (prefill) shapes
-- [ ] Benchmark vs FP16 cuBLAS and vs Marlin on decode + prefill shapes
-- [ ] RESULTS.md entries; findings in `docs/03`
+Current state on `main`: **Phase 3 *Target* hit. All three M=1 Llama 3 8B
+layer shapes beat fp16 cuBLAS by 2.88–6.97×.** Full narrative in
+[`docs/03-quantized-matmul-journey.md`](docs/03-quantized-matmul-journey.md).
 
-**Exit criterion:** Track 3 *Threshold* met (Target if time allows).
+- [x] Reference: W4A16 quantize + dequant-and-matmul in PyTorch (`reference/quant_matmul_ref.py`, symmetric per-channel groupwise INT4, group_size=128 along K)
+- [x] Naive CUDA W4A16 GEMM: unpack INT4, dequant in registers, accumulate (3b, kernel `w4a16_gemm_naive_kernel`)
+- [x] `tests/test_quant.py`: 24 tests covering reference round-trip + matmul-vs-fp16 noise bounds + CUDA-vs-reference equivalence + pack/unpack roundtrip
+- [x] Optimize: K-split across 4 warps + activations cached in shmem (3c, kernel `w4a16_gemm_decode_kernel`; launcher dispatches M==1 → decode, else → naive)
+- [ ] Tensor Core path for compute-bound (prefill) shapes  *(stretch, deferred)*
+- [~] Benchmark vs FP16 cuBLAS on decode shapes (`benchmarks/bench_w4a16.py`); vs Marlin deferred
+- [x] RESULTS.md entries; findings in `docs/03`
+
+**Exit criterion:** Track 3 *Target* met (2–3× over fp16 cuBLAS on
+decode shapes — landed at 2.88×–6.97×).
 
 ---
 
