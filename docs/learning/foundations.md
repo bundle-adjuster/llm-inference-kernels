@@ -593,3 +593,718 @@ that runs through every kernel we wrote.
 
 Before continuing, try to answer at least the §1.6 and §1.7 checkpoints
 without looking. Those two are load-bearing for the rest of the book.
+
+---
+
+# Part 2 — The GPU mental model
+
+Part 1 told you *what* the kernel computes. Part 2 tells you *how the
+hardware will run it* and, crucially, *what will limit how fast*. This
+is the part of the book that you'll come back to most — it's the
+toolkit for reading any kernel and knowing where the time is going.
+
+## 2.1 Why a mental model?
+
+When we write a CUDA kernel, what we're really doing is *describing a
+parallel computation to the hardware*. The hardware then has a lot of
+discretion in *how* it runs it — which threads execute when, which
+loads come back when, which warps run on which SM. To make a kernel
+fast, we need a working theory of what the hardware will do with our
+code.
+
+The frustrating-but-honest truth: there are many ways a kernel can be
+"slow," and you can't tell which one applies just by looking at the
+code. You have to *measure*, then *diagnose*. The mental model is what
+lets you connect a measured number (e.g. "0.713 ms / 189 GB/s") to a
+specific bottleneck (e.g. "we're not bandwidth-limited; the per-iter
+dependency chain is").
+
+By the end of Part 2 you should be able to:
+
+1. Read a kernel and predict roughly how many warps will run per SM.
+2. Look at a per-iter loop body and identify what the longest serial
+   dependency chain through it is.
+3. Hear "this kernel hits 189 GB/s of 1008 peak" and know whether
+   that's good or bad given the workload.
+4. Recognise the three diagnostic categories — bandwidth-bound,
+   compute-bound, dependency-chain-bound — and know which
+   optimizations target which.
+
+These are the skills behind every commit in Phase 1, Phase 2, and Phase
+3, even when we didn't say so explicitly.
+
+> **Checkpoint 2.1**
+> Before reading further: when a kernel achieves "20% of peak HBM
+> bandwidth," does that mean it's fast, or slow? What would you need
+> to know to decide?
+
+---
+
+## 2.2 The hardware: SMs, warps, threads
+
+The RTX 4090 has **128 Streaming Multiprocessors (SMs)**. Each SM is a
+mostly-independent compute unit with its own register file, shared
+memory, L1 cache, and four "warp schedulers." All 128 SMs share the L2
+cache and HBM.
+
+```
+GPU
+ ├── 128 SMs
+ │    ├── 4 warp schedulers           (issue 1 warp's instruction per cycle each)
+ │    ├── 65536 32-bit registers      (split among resident threads)
+ │    ├── 100 KB shared memory + L1   (split between the two, configurable)
+ │    └── compute units               (CUDA cores for fp32/int, Tensor Cores for MMA)
+ │
+ ├── L2 cache                          (72 MB total, shared across all SMs)
+ └── HBM (main DRAM)                   (24 GB, ~1008 GB/s peak bandwidth)
+```
+
+When you launch a kernel like:
+
+```cuda
+dim3 grid(batch, n_heads);   // 8 × 32 = 256 blocks
+dim3 block(32);              // 32 threads per block
+my_kernel<<<grid, block>>>(...);
+```
+
+…the GPU schedules the 256 blocks onto the 128 SMs. Each block stays on
+the SM it's assigned to until it finishes (no migration). Multiple
+blocks may run on the same SM at once if they fit (more on this in
+§2.5).
+
+Inside a block, threads are organised into **warps of 32 threads**.
+A block of 32 threads = 1 warp. A block of 128 threads = 4 warps. A
+block of 1024 threads = 32 warps. Warps are the fundamental unit of
+execution: the SM doesn't issue instructions per-thread, it issues
+*per-warp* (one instruction at a time across all 32 threads).
+
+### Why 32?
+
+Hardware history. The original GPUs had SIMD-32 execution units, and
+the abstraction stuck. Modern NVIDIA GPUs all have warp size 32.
+AMD GPUs have warp size 64 (they call them "wavefronts"). The number
+matters for our purposes because:
+
+- Warp shuffles operate on 32 lanes (`__shfl_xor_sync`, etc.).
+- A "warp-wide" memory load that's coalesced reads up to 32 elements
+  per instruction.
+- Block sizes are usually multiples of 32 so no warp has idle lanes.
+
+The single most important fact about a warp: **all 32 lanes execute
+the same instruction in the same cycle**. That's *SIMT* — Single
+Instruction, Multiple Threads. We'll get back to what happens when
+the lanes diverge in §2.4.
+
+### Mapping the kernels we wrote
+
+Here's how the actual Phase 1 attention kernel `v3` maps to this
+hierarchy:
+
+```
+Launch: grid(batch=8, n_heads=32) = 256 blocks
+        block(32) = 32 threads = 1 warp per block
+
+Each block:
+  - Runs on one SM. With 256 blocks and 128 SMs, ~2 blocks per SM.
+  - Holds 1 warp (32 threads) — single-warp block.
+  - Owns one (batch, head) pair: reads q [head_dim], K and V
+    [seqlen_kv, head_dim], writes out [head_dim].
+
+Each thread (= one lane within the warp):
+  - Owns 4 d-lanes (since head_dim=128, 128/32 = 4).
+  - Iterates the seqlen_kv loop, accumulating one output.
+```
+
+For Phase 3 v3 (Phase 3c decode GEMM), the block has 128 threads
+(4 warps) and they share the K-reduction work — different kernel
+structure, same building blocks.
+
+> **Checkpoint 2.2**
+> - For a kernel launched with `grid(8, 32), block(32)`, how many warps
+>   total are dispatched to the GPU?
+> - On the RTX 4090's 128 SMs, what's the *minimum* number of SMs that
+>   would have to be active to host that workload? (Hint: at least one
+>   warp per used SM, but multiple blocks can share.)
+
+---
+
+## 2.3 The memory hierarchy
+
+If you internalise one thing from Part 2, make it this: **memory is a
+hierarchy with latencies that span 3–4 orders of magnitude**. Where
+your data lives determines whether your kernel runs in microseconds or
+milliseconds.
+
+The hierarchy, fastest to slowest, on RTX 4090:
+
+| Storage      | Scope               | Size         | Read latency (rough) | Bandwidth |
+|--------------|---------------------|--------------|---------------------:|----------:|
+| Registers    | Per-thread          | 255 × 32-bit | 0 cycles (free)      | n/a       |
+| Shared mem   | Per-block           | 100 KB / SM (configurable) | ~20 cycles | ~10 TB/s/SM |
+| L1 cache     | Per-SM              | shares 100 KB with shmem | ~28 cycles | ~10 TB/s/SM |
+| L2 cache     | Per-GPU             | 72 MB          | ~190 cycles        | ~5 TB/s total |
+| HBM (DRAM)   | Per-GPU             | 24 GB          | ~500 cycles        | 1008 GB/s peak |
+
+The actual cycles vary by access pattern, contention, cache state, and
+fp16 vs int32 vs ... — these numbers are ballpark. But the *ratios*
+matter: HBM is ~25× slower latency than shmem, and ~100× slower than
+registers.
+
+A working analogy: **think of HBM as a slow truck and shmem as a fast
+conveyor belt right next to your workbench**. You don't move things off
+the workbench unless you have to. You load big batches from the truck
+once and then work from the conveyor belt.
+
+### What "bandwidth-bound" actually means
+
+When we say a kernel is "bandwidth-bound on HBM," we mean: the runtime
+is set by *how fast we can pull data through the HBM-to-SM pipe*, and
+no amount of compute optimization will help unless we cut HBM bytes.
+The 4090's HBM peak is 1008 GB/s. If our kernel needs to move 128 MB
+through HBM and that takes 0.127 ms, we're at HBM peak. If it takes
+0.7 ms, we're at 18% of HBM peak — meaning *something else is the
+ceiling* and we have headroom.
+
+The cheat-sheet question: **"if we doubled the HBM bandwidth, would
+the kernel run twice as fast?"** If yes, bandwidth-bound. If no,
+something else.
+
+### Where each thing lives in our kernels
+
+For the Phase 1 v3 decode attention kernel:
+
+```
+q   (one [head_dim] = 256 bytes per (batch, head))   →  loaded into per-thread REGISTERS once at start
+K   (whole [seqlen_kv, head_dim] = 1 MB per block)   →  streamed from HBM via L1/L2
+V   (whole [seqlen_kv, head_dim] = 1 MB per block)   →  streamed from HBM via L1/L2
+o_acc, m, l (per-thread running state)               →  REGISTERS for the whole loop
+out (one [head_dim])                                 →  written to HBM at end (one vec store)
+```
+
+Q lives in registers because it's reused over every j iteration. KV is
+read once and not reused, so streaming from HBM is fine — we don't
+benefit from caching it. The running softmax state stays in registers
+because per-iter updates are critical-path.
+
+For the Phase 2b INT8 KV attention, the structure is the same but K
+and V live as int8 in HBM (half the bytes vs fp16). For Phase 3c W4A16,
+the activations are *cached in shared memory* because the same K
+values are reused N times across the output columns the block
+computes — that reuse is what makes shmem caching worth it.
+
+> **Checkpoint 2.3**
+> - In the v3 decode attention kernel, why is Q held in registers
+>   rather than streamed from HBM?
+> - In the Phase 3c W4A16 GEMM kernel, why is `act` worth caching in
+>   shared memory but `weight` not?
+> - The 4090's HBM peak is 1008 GB/s. If a decode kernel reads 128 MB
+>   of KV per call, what's the *theoretical fastest* it could run?
+
+---
+
+## 2.4 SIMT execution: same instruction, 32 lanes
+
+The single-instruction-multiple-thread model is the most important
+performance abstraction in CUDA, and it has *consequences*.
+
+### What "lockstep" means
+
+When a warp executes an instruction like `c = a + b`, all 32 lanes
+execute that instruction in the same cycle. Each lane has its own
+copy of `a`, `b`, `c` in its registers — the instruction operates on
+32 register copies simultaneously.
+
+So if the warp does:
+
+```cuda
+float a = some_value;        // lane 0 has its own, lane 1 has its own, ...
+float b = other_value;
+float c = a + b;             // all 32 lanes add, in one cycle
+```
+
+The work is "free" in the sense that lane 1 doing this work doesn't
+make lane 0's work slower. The warp's compute throughput is *all 32
+lanes at once*.
+
+This is why we keep saying "**redundant scalar work is essentially
+free under SIMT**." If lane 0 needs to compute `m_new = max(m, s_j)`,
+and we have 32 lanes already executing the same warp instruction, then
+having all 32 lanes redundantly compute the same `m_new` is free.
+Lanes 1–31 weren't going to do anything more useful on that cycle
+anyway. (This was the Phase 1 v1 "wrong hypothesis" lesson: trying to
+*save* this "redundant" work by concentrating it in one lane introduced
+serialization where there was none.)
+
+### Divergence: when lanes don't agree
+
+What if the lanes need to do *different* things? Consider:
+
+```cuda
+if (threadIdx.x < 16) {
+    a = x + y;
+} else {
+    a = x - y;
+}
+```
+
+In the warp, the first 16 lanes want `x + y`; the other 16 want `x - y`.
+The hardware can't execute two different instructions in one cycle.
+Instead, it executes the first branch with only lanes 0–15 *active*
+(lanes 16–31 are masked off — their results aren't written), then the
+second branch with lanes 16–31 active. The cost: **2× the cycles**
+for that block of code.
+
+Divergence is most painful when it's complex or unpredictable.
+Predictable divergence (e.g. one branch is rare) costs less because the
+"both branches" cost is amortized.
+
+For our kernels, we mostly *avoid* divergence by design:
+- Bounds checks at the top of the kernel (`if (n >= N) return;`)
+  diverge but only at the edges, so most blocks aren't affected.
+- The per-iter loop body has no `if`s that depend on per-thread state —
+  every lane does the same dot-product, the same softmax update, the
+  same FMA, just on its own data.
+
+### Warp shuffles: cross-lane communication
+
+Within a warp, lanes can exchange register values without going through
+shared memory using **warp shuffles**:
+
+```cuda
+float partial = q_val * k_val;
+partial = __shfl_xor_sync(0xFFFFFFFF, partial, 16);   // swap with lane^16
+partial = __shfl_xor_sync(0xFFFFFFFF, partial, 8);    // swap with lane^8
+... // continue with offsets 4, 2, 1
+// Now all 32 lanes have the same value: the sum across the whole warp.
+```
+
+A shuffle is a "butterfly" pattern: with 5 shuffle ops (offsets 16, 8,
+4, 2, 1), every lane ends up with the sum (or max, etc.) across the
+whole warp. This is *much* cheaper than going through shared memory
+because there's no shmem store + sync + load — it's all register-to-
+register over the warp's internal datapath. **5 cycles vs ~30+ for
+shmem reduction.**
+
+Our kernels use this in `warp_reduce_sum` and `warp_reduce_max`. The
+v3 attention kernel's entire dot-product reduction is one
+`warp_reduce_sum` call — no shmem involved.
+
+> **Checkpoint 2.4**
+> - When 16 lanes take a branch and 16 don't, how many cycles does
+>   the branch cost compared to all 32 taking the same path?
+> - `warp_reduce_sum` does 5 shuffle operations. Why exactly 5? (Hint:
+>   what powers of 2 are involved?)
+> - In Phase 1 v3, we said "redundant scalar work across the warp is
+>   free." Give a concrete example from a kernel where this principle
+>   matters.
+
+---
+
+## 2.5 Occupancy and latency hiding
+
+Threads and warps don't run continuously — they spend a lot of time
+*stalled*, waiting for memory loads to complete, waiting for the
+result of an `__expf`, etc. The GPU's main strategy for hiding these
+stalls is to keep many warps resident on an SM and switch between
+them when one stalls.
+
+### What "resident" means
+
+An SM has a finite budget — registers, shared memory, warp slots.
+When a block is launched onto an SM, it *uses* some of that budget:
+
+```
+Resources used by one block of K threads, R registers/thread, S bytes shmem:
+  registers    : K · R                  (out of 65536)
+  shared mem   : S                      (out of 100 KB)
+  warp slots   : ceil(K / 32)           (out of 48 warps/SM on Ada)
+  block slots  : 1                      (out of 16-24 blocks/SM on Ada)
+```
+
+The SM holds as many blocks as fit under all four constraints. The
+**occupancy** is the resulting `active warps / max warps`:
+
+```
+occupancy = (blocks_per_SM · warps_per_block) / 48
+```
+
+For v3 (single-warp block, 33 registers/thread): the constraint is the
+block-slot limit of 16 (or whatever the Ada hard cap is on small
+blocks). 16 blocks × 1 warp = 16 warps. Occupancy = 16/48 ≈ 33%.
+
+For Phase 1 v0 (128-thread block, 29 registers/thread): up to 12 blocks
+× 4 warps = 48 warps = 100% occupancy.
+
+### How occupancy helps
+
+When a warp issues a memory load that misses in cache, it takes
+hundreds of cycles to come back. During those cycles, the warp scheduler
+looks at the *other* resident warps and picks one whose next
+instruction is ready to issue. If there's no ready warp, the SM stalls.
+
+With many resident warps, there's almost always *some* warp ready, so
+the SM keeps issuing instructions. **High occupancy = latency hiding
+via parallel waiting**.
+
+But there's a saturation: once you have enough warps that the SM is
+never stalled waiting, more warps don't help. Past that point, occupancy
+is just overhead (register pressure, more shmem competition, etc.).
+
+### When occupancy matters and when it doesn't
+
+It matters when the kernel has lots of memory-load latency to hide. If
+every loop iteration has a cache-missing load with a 500-cycle latency,
+you want enough warps that the SM can do ~16 instructions per cycle
+across them while one waits.
+
+It *doesn't matter* when the per-iter dependency chain is the bottleneck.
+If each warp's next instruction depends on the previous one (true
+serial), no amount of additional warps helps — the SM still issues
+4 instructions per cycle, but one warp's instructions can only proceed
+in sequence.
+
+This was the Phase 1 v3 lesson: we traded 4 warps/block (full occupancy)
+for 1 warp/block (33% occupancy) and *gained* 1.50× speedup. The lost
+latency hiding didn't matter because the per-iter chain was the
+ceiling. **Occupancy is a means, not an end.**
+
+### How to read the bench output
+
+When we say v3 is at "33% occupancy" we mean: of the 48 warp slots
+each SM could hold, only 16 are active. The remaining slots are wasted,
+but that's not the same as a slow kernel — it's only slow if those
+extra warps would have helped hide latency, which they don't here.
+
+> **Checkpoint 2.5**
+> - A kernel uses 60 registers per thread. With 65536 registers per SM,
+>   how many threads can it have resident? (Ignore other constraints.)
+> - Phase 1 v3 has 33% occupancy and is faster than v2 at 100%
+>   occupancy. Explain this in one sentence.
+> - When would *adding* warps make the kernel slower?
+
+---
+
+## 2.6 Synchronization: what __syncthreads costs and means
+
+When threads in different warps need to coordinate — write to shmem
+in one warp, read in another — you need a barrier. The two main
+primitives:
+
+### `__syncthreads()`
+
+Block-wide barrier. **Every thread in the block must reach the
+`__syncthreads` before any thread proceeds past it.** Internally:
+
+- The SM tracks how many warps have hit the barrier.
+- Warps that arrive early are parked (the scheduler picks other
+  warps).
+- When all warps in the block have hit, all are released.
+
+Cost: typically tens of cycles (it depends on how synchronised the
+warps were going in). For our kernels, the bigger cost is usually the
+*consequence* — the compiler can't reorder loads or stores across a
+`__syncthreads()`. That's a load barrier, not just a sync barrier.
+
+This is the Phase 1 v1 lesson: V loads inside the per-`j` `__syncthreads()`
+couldn't be hoisted by nvcc above the sync, so V latency couldn't hide
+behind the K reduction. The fix was to manually move the V load to the
+top of the iteration — same code, just outside the barrier.
+
+### `__syncwarp()`
+
+Warp-wide barrier (cheaper). For single-warp blocks, mostly redundant
+because the lanes are already in lockstep. But there are subtle cases
+(e.g., after writing to shmem from one lane, before another lane reads
+it) where you need an explicit warp sync to defeat compiler reordering.
+
+### Warp shuffles as cross-lane sync
+
+The `__shfl_xor_sync` calls we discussed in §2.4 don't need a separate
+sync — the "sync" is implicit in the shuffle's mask (the first arg,
+typically `0xFFFFFFFF` to require all 32 lanes participate). This is
+the cheapest way to communicate across a warp.
+
+### A subtlety: __syncthreads() and divergence
+
+`__syncthreads()` deadlocks if some threads in the block can't reach it
+(because they returned early, for example). For this reason, you'll
+see patterns like:
+
+```cuda
+// BAD — deadlocks if some threads return early
+if (n >= N) return;
+... do work ...
+__syncthreads();
+```
+
+```cuda
+// OK — all threads reach the sync
+const bool valid = (n < N);
+... do work guarded by valid ...
+__syncthreads();
+if (valid) { ... }
+```
+
+We hit this in the Phase 3c kernel where some threads might be out of
+the N range. The fix was to guard with `valid` and have all threads
+participate in the sync.
+
+> **Checkpoint 2.6**
+> - You write a kernel where every thread writes to its own shmem
+>   slot, then every thread reads that same slot back. Do you need
+>   `__syncthreads()`?
+> - In Phase 1 v1, why does putting the V load *before* the
+>   `__syncthreads()` matter for performance?
+> - What goes wrong if `__syncthreads()` appears inside an `if` branch
+>   that only some threads take?
+
+---
+
+## 2.7 The dependency chain
+
+This is the concept that *most* of our optimizations turn on, and the
+one that's least taught in a 101 course.
+
+### What "dependency chain" means
+
+In a per-iteration loop body, there's often a sequence of operations
+where each depends on the previous:
+
+```
+load → unpack → multiply by scale → FMA → softmax update → next iter
+```
+
+Each of those operations has some *latency* — the number of cycles
+from issuing the instruction to having its result available. The
+*total* latency through the chain is the sum of the latencies.
+
+If the chain is short, the next iter starts soon and throughput is
+high. If the chain is long, the next iter waits.
+
+### The "instruction issue rate" view
+
+The SM can issue ~4 warp instructions per cycle (one per warp
+scheduler). If the warps have lots of *independent* work, the SM is
+saturated — every cycle, 4 ops are issued. That's "compute-bound."
+
+But if the warps' work is *serially dependent* (instruction N depends
+on instruction N-1's result), then each warp can only have one
+instruction in flight at a time, and the warp issues at the rate of
+the chain (1 / chain_length per warp-cycle).
+
+The SM can compensate by switching between many warps — each warp has
+its own chain, and the SM rotates through them. With enough resident
+warps, the SM stays saturated even if each individual warp's chain is
+long. *This is what occupancy buys you.*
+
+When does that not work?
+
+- If each warp has only a tiny number of independent ops, you need
+  lots of warps to fill the SM. The kernel becomes occupancy-limited.
+- If memory loads are part of the chain, those add hundreds of cycles
+  of latency — even more warps needed.
+
+### "Dependency-chain-bound" as a category
+
+This is the third category beyond bandwidth-bound and compute-bound:
+the kernel is bottlenecked by **how fast the per-iter chain can
+complete**, regardless of how much compute or bandwidth is available.
+
+How to recognise it:
+- HBM is not at peak (so not bandwidth-bound).
+- Compute units are not at peak (so not compute-bound).
+- The kernel doesn't speed up with more SMs (Phase 1 v4) or more
+  parallel loads (Phase 1 v5).
+- The kernel *does* speed up when you make the chain shorter (Phase 1
+  v3's single-sync reduce, Phase 2c's per-group K scale).
+
+Phase 1 v3 → v2: the gap was a `__syncthreads()` in the middle of the
+chain. Removing it cut the chain. **The 570 µs we measured wasn't
+"sync overhead" — it was "what the chain was waiting for."**
+
+Phase 2c: by moving K scales out of the per-iter loop (loading them
+once per group instead of every iter), we cut a load+multiply from the
+chain. The structural shorter-chain made the kernel faster, not the
+fewer bytes loaded.
+
+### The diagnostic question
+
+For any kernel, ask: **what's the per-iter critical path?** Then ask:
+**what would shorten it?**
+
+For decode attention: the per-iter chain is `load K` → `dot product +
+warp_reduce_sum` → `softmax recurrence` → `FMA with V` → `next iter`.
+Each step is a few cycles or more (warp_reduce_sum is ~5 cycles for
+the shuffle tree). Total per-iter chain: ~30-50 cycles, depending on
+loads and dependencies.
+
+For W4A16 GEMM: the per-iter chain is much shorter (no softmax, no
+reduction within a thread — just FMA). That's why W4A16 wins big on
+memory-bound shapes: it has no chain ceiling and the byte savings
+translate directly.
+
+> **Checkpoint 2.7**
+> - What's the per-iter dependency chain in the v3 attention kernel?
+> - Why did the "single-sync reduce" in v2 produce *more* speedup
+>   than just removing a `__syncthreads()` would predict?
+> - Phase 2b (INT8 KV) halved KV bytes but didn't speed up the
+>   kernel. Where was the chain hiding the win?
+
+---
+
+## 2.8 The diagnostic framework
+
+You now have the vocabulary to talk about where a kernel's time goes.
+The framework:
+
+### Three bottleneck categories
+
+1. **Bandwidth-bound**: the kernel is reading data through HBM at
+   close to peak (or close to L2 peak, or whatever the relevant
+   memory level is). Cutting bytes helps. Adding more SMs doesn't.
+   *Diagnostic*: achieved bandwidth ≈ peak.
+
+2. **Compute-bound**: the kernel is doing arithmetic close to the
+   GPU's FLOPS peak. Adding more bandwidth doesn't help. Tensor Cores
+   (if applicable), wider vectorization, or fewer ops do.
+   *Diagnostic*: achieved TFLOPS ≈ peak compute.
+
+3. **Dependency-chain-bound**: neither of the above. The per-iter
+   serial chain limits throughput. Shorter chains (fewer ops per iter,
+   moving work out of the loop) help. More SMs / more bandwidth
+   don't.
+   *Diagnostic*: well below both HBM and compute peaks, kernel doesn't
+   speed up with bigger grid or wider loads.
+
+For decode attention on the 4090:
+- v3 at 189 GB/s of 1008 GB/s = 19% of HBM peak. NOT bandwidth-bound.
+- Compute-wise, attention's per-iter ops are tiny. NOT compute-bound.
+- Therefore dependency-chain-bound. The optimization lever was *the
+  chain*: v3 cut the cross-warp shmem broadcast (v2 → v3), v3 used
+  vectorized loads + single warp to keep the chain compact, v4/v5
+  failed because they didn't shorten the chain.
+
+For W4A16 GEMM on the 4090 at M=1:
+- 1577 GB/s of 1008 GB/s = 156% of HBM peak (L2-served). Effectively
+  bandwidth-bound on L2.
+- The kernel's win comes from cutting weight bytes 4× (fp16 → INT4).
+- Compute is trivial.
+
+### How to apply the framework
+
+When you measure a new kernel and it's slower than you hoped:
+
+1. **Calculate achieved bandwidth** from bytes moved / time. Compare
+   to peak. If close to peak: bandwidth-bound. Cutting bytes is your
+   tool.
+2. **Calculate achieved compute** (FLOPS / time). Compare to peak.
+   If close: compute-bound.
+3. **If neither**: dependency-chain-bound. Look at the per-iter loop
+   body and find what depends on what. The chain is your enemy.
+
+When picking an optimization:
+- Don't add bandwidth-targeting work to a kernel that isn't bandwidth-
+  bound. (Phase 1 v4 split-K, Phase 1 v5 cp.async — both lost.)
+- Don't add compute-targeting work to a kernel that isn't compute-
+  bound. (Tensor Cores at decode M=1 — wrong tool.)
+- *Do* attack the chain — but recognise what's in the chain (loads,
+  shmem hops, reductions, `__expf`, etc.).
+
+---
+
+## 2.9 Putting it together: reading a kernel like a performance engineer
+
+A working checklist for sizing up any GPU kernel:
+
+**1. Block geometry**
+- `grid` size, `block` size, total warps?
+- Reasonable for the GPU? (e.g. 256 blocks of 4 warps each on 128 SMs
+  is fine; 32 blocks of 1 warp each is severely under-occupied.)
+
+**2. Per-thread work**
+- What does each thread own? Registers used?
+- Does each thread loop?
+
+**3. Memory pattern**
+- What's read from HBM, how many times?
+- What's cached in shmem, L1, registers?
+- Coalesced loads across the warp?
+
+**4. Per-iter critical path**
+- What's the longest serial dependency through one loop iter?
+- How many cycles does it take?
+
+**5. Synchronization**
+- `__syncthreads()` calls — how many per iter? Why?
+- Any places where loads sit *inside* a sync that could be hoisted out?
+
+**6. Diagnostic guess**
+- Bandwidth, compute, or chain bound?
+- What evidence (from the code) supports that guess?
+- What's the right optimization given the guess?
+
+Try applying this checklist to your favorite of the v0–v5 attention
+kernels before reading on. (Hint: they all have different answers for
+items 1, 4, and 5.)
+
+---
+
+## 2.10 Summary of Part 2
+
+By the end of Part 2 you should be comfortable with:
+
+- The hierarchy: **GPU → SMs → blocks → warps → threads**, and how a
+  kernel launch maps to this.
+- **SIMT execution**: 32 lanes in lockstep, divergence costs, why
+  redundant warp-wide work is free.
+- **Memory hierarchy**: registers / shmem / L1 / L2 / HBM, with
+  latencies spanning 3–4 orders of magnitude. Where to put what.
+- **Occupancy and latency hiding**: more resident warps → more
+  in-flight work → better at hiding memory latency. Capped by
+  register/shmem/warp budgets.
+- **Synchronization**: `__syncthreads()` is a barrier *and* a load
+  barrier. Warp shuffles are cheaper than shmem reductions.
+- **The dependency chain**: per-iter serial path that limits
+  throughput when neither bandwidth nor compute is at peak.
+- **The diagnostic framework**: bandwidth-bound vs compute-bound vs
+  dependency-chain-bound — and how to tell which applies.
+
+Part 3 will put this to work: we'll walk through the v0 → v5 attention
+journey, applying these tools at each step. By the end you should be
+able to predict *why* an optimization will or won't help, before
+measuring.
+
+---
+
+## 2.11 Glossary additions
+
+| Term | Meaning |
+|------|---------|
+| SM | Streaming Multiprocessor. The 4090 has 128. |
+| Warp | 32 threads executing in SIMT lockstep. |
+| Lane | One thread within a warp; `threadIdx.x % 32`. |
+| Block | Set of warps that share an SM and shared memory. |
+| Grid | Set of blocks. The kernel launch dispatches the grid. |
+| Resident warp | A warp the SM is currently holding (vs queued or finished). |
+| Occupancy | `active warps / max warps per SM`. |
+| HBM | High Bandwidth Memory. The GPU's main DRAM. |
+| Coalesced load | A warp-wide load where the 32 lanes' addresses are contiguous, served as one wide transaction. |
+| Bandwidth-bound | Kernel runtime is set by data-movement throughput. |
+| Compute-bound | Kernel runtime is set by arithmetic throughput. |
+| Dependency-chain-bound | Kernel runtime is set by the per-iter serial dependency path. |
+| SIMT | Single Instruction, Multiple Threads. NVIDIA's execution model. |
+| Divergence | Lanes within a warp taking different branches; serializes the branches. |
+| Warp shuffle | Register-to-register communication across lanes within a warp. |
+| `__syncthreads()` | Block-wide barrier. Also prevents the compiler from reordering loads across it. |
+| Latency hiding | Using other warps' work to fill in time while one warp waits on memory. |
+
+---
+
+**Ready for Part 3?** Part 3 walks the v0 → v5 attention kernel
+evolution using Part 2's framework. Each kernel gets a paragraph or
+two of "here's what the bottleneck was at this step, here's the lever
+we pulled, here's why it worked (or didn't)."
+
+Before continuing, work through the checkpoint questions in §2.5,
+§2.7, and §2.8 without looking — those three are the load-bearing
+ones for Part 3.
