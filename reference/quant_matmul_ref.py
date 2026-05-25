@@ -137,6 +137,34 @@ def quantized_matmul_ref(
 
 # ---- Convenience preset: end-to-end one-liner ----
 
+def pack_int4_along_k(q_int8: torch.Tensor) -> torch.Tensor:
+    """Pack `[K, N] int8` weights (values in [-7, 7]) into `[K/8, N] int32`.
+
+    Each output int32 holds 8 K-values for one output column. Bit
+    `i*4 .. i*4+3` stores K position `k_pack*8 + i`. The kernel reads
+    one int32 per inner-loop iter and unpacks 8 nibbles via the
+    shift-trick `(signed_w << (28 - i*4)) >> 28` (arithmetic right
+    shift sign-extends in PTX).
+
+    Args:
+        q_int8: `[K, N]` int8 with values in [-7, 7]. K must be a
+            multiple of 8.
+
+    Returns:
+        `[K/8, N]` int32. Torch has no native uint32; the int32 bit
+        pattern is identical to uint32 and the CUDA kernel
+        reinterprets it as such.
+    """
+    K, N = q_int8.shape
+    assert K % 8 == 0, f"K={K} must be a multiple of 8 to pack int4 along K"
+    # q_grp[k_pack, i, n] = the i-th K-value in the k_pack-th 8-block
+    q_grp = q_int8.view(K // 8, 8, N).to(torch.int32) & 0xF
+    packed = torch.zeros(K // 8, N, dtype=torch.int32, device=q_int8.device)
+    for i in range(8):
+        packed = packed | (q_grp[:, i, :] << (i * 4))
+    return packed
+
+
 def w4a16_matmul_ref(
     act: torch.Tensor, W: torch.Tensor, group_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -24,6 +24,7 @@ import torch
 from reference.quant_matmul_ref import (
     _QMAX_INT4,
     dequantize_weights_int4_groupwise,
+    pack_int4_along_k,
     quantize_weights_int4_groupwise,
     quantized_matmul_ref,
     w4a16_matmul_ref,
@@ -176,6 +177,104 @@ def test_int4_storage_quarter_of_fp16_when_packed() -> None:
     assert 0.24 <= ratio <= 0.27, (
         f"int4 W storage ratio {ratio:.4f} out of expected band"
     )
+
+
+# ---- CUDA kernel vs PyTorch reference ----
+
+llmik = pytest.importorskip(
+    "llmik_cuda",
+    reason="build the extension: python setup.py build_ext --inplace",
+)
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device required",
+)
+
+
+def test_pack_unpack_int4_roundtrip() -> None:
+    """The Python packer matches the kernel's unpack convention.
+
+    Constructs a known int8 weight, packs it, then unpacks bit-by-bit
+    the same way the CUDA kernel does (`(signed_w << (28 - i*4)) >> 28`)
+    and checks bit-equality.
+    """
+    K, N = 16, 4
+    q = torch.tensor([
+        [ 7, -7,  3, -3],
+        [ 0,  1, -1,  2],
+        [-2,  4, -4,  5],
+        [-5,  6, -6,  7],
+        [ 1,  2,  3,  4],
+        [ 5,  6,  7, -7],
+        [-6, -5, -4, -3],
+        [-2, -1,  0,  1],
+        [ 2,  3,  4,  5],
+        [ 6,  7, -7, -6],
+        [-5, -4, -3, -2],
+        [-1,  0,  1,  2],
+        [ 3,  4,  5,  6],
+        [ 7, -7, -6, -5],
+        [-4, -3, -2, -1],
+        [ 0,  1,  2,  3],
+    ], dtype=torch.int8)
+    packed = pack_int4_along_k(q)
+    assert packed.shape == (K // 8, N)
+
+    # Reproduce kernel unpack in Python.
+    for k_pack in range(K // 8):
+        for n in range(N):
+            w = int(packed[k_pack, n].item())
+            for i in range(8):
+                # Shift to high 4 bits, then arithmetic right shift 28.
+                shifted = (w << (28 - i * 4)) & 0xFFFFFFFF
+                if shifted & 0x80000000:
+                    shifted |= ~0xFFFFFFFF
+                else:
+                    pass
+                # Equivalent: int32 arith right shift of `shifted` by 28.
+                # In Python, this is just // (2**28) for non-negative; for
+                # negative use the signed interpretation.
+                if shifted >= 0x80000000:
+                    shifted -= 0x100000000  # Make it the signed int32 value
+                nibble = shifted >> 28      # Python's `>>` on negatives is arithmetic
+                k = k_pack * 8 + i
+                assert nibble == int(q[k, n].item()), (
+                    f"pack/unpack mismatch at k={k}, n={n}: "
+                    f"got {nibble}, expected {int(q[k, n].item())}"
+                )
+
+
+@requires_cuda
+@pytest.mark.parametrize("name,K,N", LLAMA_LAYER_SHAPES)
+@pytest.mark.parametrize("M", [1, 8])
+def test_cuda_w4a16_gemm_matches_reference(
+    name: str, K: int, N: int, M: int,
+) -> None:
+    """CUDA W4A16 GEMM vs reference `act @ dequant(W)`.
+
+    Both paths see the *same* dequantized W (modulo where dequantization
+    happens — eager in the reference, fused in the kernel), so the only
+    difference is fp32 accumulation order. We use the same 2e-2 rtol/atol
+    gate as Phase 1/2 attention.
+    """
+    torch.manual_seed(0)
+    group_size = 128
+    W = _make_weight(K, N).cuda()
+    act = torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.1
+
+    # Quantize on the host side (offline-style — what production would do).
+    q, scale = quantize_weights_int4_groupwise(W, group_size=group_size)
+    packed = pack_int4_along_k(q)
+
+    # CUDA path.
+    out_cuda = llmik.w4a16_gemm(act, packed, scale, group_size)
+
+    # Reference: dequant W, then fp32 matmul, then cast back to fp16.
+    W_hat = dequantize_weights_int4_groupwise(q, scale, group_size).cuda()
+    out_ref = (act.float() @ W_hat).to(torch.float16)
+
+    torch.testing.assert_close(out_cuda.float(), out_ref.float(),
+                               rtol=2e-2, atol=2e-2)
 
 
 def test_quantize_handles_small_K_smoke() -> None:

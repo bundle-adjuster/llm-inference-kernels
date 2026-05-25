@@ -6,6 +6,7 @@
 
 #include "attention/fused_attention.cuh"
 #include "kv_cache/kv_compress.cuh"
+#include "quant/quant_matmul.cuh"
 
 
 // Fused decode attention with fp16 KV (current Phase 1 v3 kernel).
@@ -241,6 +242,53 @@ torch::Tensor decode_attention_int4(torch::Tensor q,
 }
 
 
+// Phase 3 W4A16 GEMM. act: [M, K] fp16. weight_packed: [K/8, N] int32
+// (the bit pattern is uint32; torch has no native uint32). scale:
+// [n_groups, N] fp16 with n_groups = K / group_size. group_size must
+// be a multiple of 8 (the int4 pack width along K).
+// Returns: out [M, N] fp16.
+torch::Tensor w4a16_gemm(torch::Tensor act,
+                         torch::Tensor weight_packed,
+                         torch::Tensor scale,
+                         int64_t group_size) {
+    TORCH_CHECK(act.is_cuda() && weight_packed.is_cuda() && scale.is_cuda(),
+                "all inputs must be CUDA tensors");
+    TORCH_CHECK(act.scalar_type() == torch::kHalf, "act must be fp16");
+    TORCH_CHECK(weight_packed.scalar_type() == torch::kInt32,
+                "weight_packed must be int32 (uint32 bit pattern)");
+    TORCH_CHECK(scale.scalar_type() == torch::kHalf, "scale must be fp16");
+    TORCH_CHECK(act.is_contiguous() && weight_packed.is_contiguous()
+                && scale.is_contiguous(), "all tensors must be contiguous");
+    TORCH_CHECK(act.dim() == 2 && weight_packed.dim() == 2 && scale.dim() == 2,
+                "all inputs must be 2D");
+
+    const int M       = act.size(0);
+    const int K       = act.size(1);
+    const int K_packs = weight_packed.size(0);
+    const int N       = weight_packed.size(1);
+    const int n_groups = scale.size(0);
+    TORCH_CHECK(K == K_packs * 8,
+                "act.K must equal weight_packed.K_packs * 8");
+    TORCH_CHECK(scale.size(1) == N, "scale and weight_packed N mismatch");
+    TORCH_CHECK(group_size > 0 && group_size % 8 == 0,
+                "group_size must be a positive multiple of 8");
+    TORCH_CHECK(K == n_groups * static_cast<int>(group_size),
+                "K must equal n_groups * group_size");
+
+    auto out = torch::empty({M, N}, act.options());
+
+    launch_w4a16_gemm(
+        reinterpret_cast<const half*>(act.data_ptr<at::Half>()),
+        reinterpret_cast<const uint32_t*>(weight_packed.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        M, N, K, static_cast<int>(group_size),
+        at::cuda::getCurrentCUDAStream());
+
+    return out;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_attention", &decode_attention,
           "Fused decode attention (fp16 KV, custom CUDA kernel)");
@@ -256,4 +304,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "INT4 per-token quantization, packed (KIVI V path)");
     m.def("decode_attention_int4", &decode_attention_int4,
           "Fused decode attention reading KIVI INT4 KV with fused dequant");
+    m.def("w4a16_gemm", &w4a16_gemm,
+          "W4A16 quantized matmul: fp16 act @ INT4 packed weight (decode-shape kernel)");
 }

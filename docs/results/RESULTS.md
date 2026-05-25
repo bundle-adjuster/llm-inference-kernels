@@ -73,10 +73,45 @@ fp16 baseline ppl = 7.055.
 
 ## Track 3 — Quantized matmul (W4A16)
 
-| Shape (M,K,N) | Commit | FP16 cuBLAS | This kernel | Speedup | % of Marlin |
-|---------------|--------|-------------|-------------|---------|-------------|
-| _TBD decode_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| _TBD prefill_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+Microbench workload: Llama 3 8B linear-layer shapes. Symmetric INT4
+weights with groupwise scales along K (group_size=128). Activations
+fp16. Measured by an ad-hoc bench against `torch.matmul` (cuBLAS fp16).
+
+`Speedup vs fp16` is `cuBLAS_latency / w4a16_latency` — values > 1 mean
+this kernel beats fp16 cuBLAS.
+
+### Phase 3b — naive W4A16 GEMM (one warp per output tile of 32 columns)
+
+| Shape (K, N)   | M  | Commit | cuBLAS fp16 | w4a16 naive | Speedup |
+|----------------|---:|--------|------------:|------------:|--------:|
+| 4096 × 4096    |  1 | _HEAD_ | 0.047 ms    | 0.088 ms    | 0.53× |
+| **4096 × 14336** (MLP up/gate) | **1** | _HEAD_ | **0.133 ms** | **0.084 ms** | **1.59×** |
+| 14336 × 4096 (MLP down) |  1 | _HEAD_ | 0.133 ms | 0.284 ms | 0.47× |
+| (any)          |  8 | _HEAD_ | ~M=1 |   scales linearly with M | ≤ 0.21× |
+| (any)          | 32 | _HEAD_ | ~M=1 |   scales linearly with M | ≤ 0.05× |
+
+Correctness vs reference: max abs diff at rtol/atol = 2e-2 across all
+6 (shape, M) configs in `tests/test_quant.py::test_cuda_w4a16_gemm_matches_reference`.
+
+**Headline**: at the canonical decode shape (M=1, K=4096, N=14336), the
+naive kernel **beats fp16 cuBLAS by 1.59×**. The W4A16 thesis holds —
+when grid parallelism is enough (large N) and the bottleneck is weight
+HBM traffic (small M), 4× less weight bytes ≈ proportional latency win.
+
+**What the naive doesn't handle**, deferred to Phase 3c:
+- Small N (=4096): only 128 blocks of 32 columns — under-fills the
+  4090's 128 SMs.
+- M > 1: kernel iterates M sequentially, reloading weights per row.
+  cuBLAS amortises by batching M into a GEMM.
+- Per-thread bookkeeping in long-K cases (K=14336): no vectorisation,
+  no `act` shmem caching. L1 catches the act reuse across the 32
+  threads in a block but not across blocks.
+
+### Phase 3c — optimized decode W4A16 GEMM
+
+| Shape (K, N)   | M  | Commit | cuBLAS fp16 | w4a16 v1 | Speedup |
+|----------------|---:|--------|------------:|---------:|--------:|
+| _TBD_ |  1 | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 
 ## End-to-end (Phase 4)
 
