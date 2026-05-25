@@ -1308,3 +1308,799 @@ we pulled, here's why it worked (or didn't)."
 Before continuing, work through the checkpoint questions in §2.5,
 §2.7, and §2.8 without looking — those three are the load-bearing
 ones for Part 3.
+
+---
+
+# Part 3 — Decode attention, naive → fast
+
+This is where Parts 1 and 2 come together. We walk through every kernel
+version we wrote — v0 through v5 — and at each step we'll do four
+things:
+
+1. **State the bottleneck of the previous version** using the
+   diagnostic framework from §2.8 (bandwidth / compute / dependency-
+   chain).
+2. **Form the hypothesis** for the change — what we believe should
+   move the bottleneck.
+3. **Sketch the implementation** — enough to re-derive the kernel from
+   memory.
+4. **Reconcile** — was the hypothesis right? Read the numbers; learn
+   the lesson.
+
+After Part 3 you should be able to:
+
+- Walk through the v0 → v3 progression from memory.
+- Recognise the v1 / v4 / v5 wrong-hypothesis traps when they appear in
+  new contexts.
+- Explain to a colleague why v3 wins where v4 doesn't.
+
+> **Heads up**: this part is the longest in the book. Don't try to read
+> it in one sitting. v0–v3 form one arc (the wins); v4–v5 form a
+> shorter second arc (the regressions). Take a break between them.
+
+---
+
+## 3.1 v0 — the naive two-pass softmax baseline
+
+### What we're building
+
+The contract is fixed: for one (batch, head) pair, compute
+
+```
+s[j]   = scale · dot(q, K[j, :])              for j in 0..seqlen_kv-1
+m      = max(s)
+p[j]   = exp(s[j] − m) / Σ exp(s[j] − m)
+o[d]   = Σ_j p[j] · V[j, d]                   for d in 0..head_dim-1
+```
+
+`q` has shape `[head_dim]`, K and V have shape `[seqlen_kv, head_dim]`,
+`out` has shape `[head_dim]`. Llama 3 8B head config: `head_dim = 128`,
+plus the GQA index map `kv(h) = h / 4` to pick the right KV head.
+
+### Block geometry
+
+The natural mapping:
+- **Grid**: `(batch, n_heads)`. One block per (batch, head) pair. For
+  `batch=8, n_heads=32` we get 256 blocks.
+- **Block**: `(head_dim) = 128 threads = 4 warps`. Each thread owns
+  one output lane `d = threadIdx.x`.
+
+This gives every thread a clear role: thread `d` is responsible for
+producing `o[d]`, the d-th output element.
+
+### Three phases (the naive structure)
+
+The v0 algorithm has three sequential phases, with shared memory
+holding the score vector `s[0..seqlen_kv)` between them:
+
+**Phase 1 — compute scores.** For each `j` in 0..seqlen_kv-1:
+- Every thread computes a partial dot product `q[d] * K[j, d]`.
+- The 128 threads reduce across the block (warp reduce + shmem combine)
+  to get the full `dot(q, K[j, :])` as a single scalar.
+- Multiplied by `scale = 1/√head_dim` and stored in `s_smem[j]`.
+
+This loop costs **two `__syncthreads()` per j** — one to gather warp
+partials into shmem, one to broadcast the final result.
+
+**Phase 2 — softmax.** Now `s_smem[0..seqlen_kv)` is fully populated.
+- Block-reduce max over `s_smem` → `m`.
+- Each thread computes `s_smem[j] := exp(s_smem[j] − m)` for its
+  strided j (and writes back). Block-reduce sum over the exp'd values
+  → `l`.
+- We'll divide by `l` in Phase 3.
+
+**Phase 3 — output.** For each `j` in 0..seqlen_kv-1:
+- Every thread loads `p[j] = s_smem[j] / l` (already in shmem).
+- Each thread reads `V[j, d]` (where `d = threadIdx.x`).
+- Accumulates `o += p[j] · V[j, d]` into a per-thread fp32 register.
+
+After the loop, each thread writes its `o[d]` to global memory as fp16.
+
+### Memory inventory
+
+- `q`: loaded into per-thread registers at kernel start (each thread
+  holds `q[threadIdx.x]`, one scalar per thread).
+- `K`: streamed from HBM through L2/L1 in Phase 1. Each thread reads
+  `K[j, threadIdx.x]` per j-iter.
+- `V`: streamed from HBM through L2/L1 in Phase 3. Each thread reads
+  `V[j, threadIdx.x]` per j-iter.
+- `s_smem`: dynamic shared memory of size `seqlen_kv × 4 bytes`. For
+  `seqlen_kv = 4096`, that's 16 KiB. Below the 48 KiB default cap.
+- `reduce_smem`: a small scratch for the block reduction (one slot per
+  warp, so 4 floats = 16 bytes).
+
+### What kind of kernel is this?
+
+Using §2.8: is v0 bandwidth-bound, compute-bound, or chain-bound?
+
+The Phase 1 loop reads `K` once and Phase 3 reads `V` once — both at
+fp16. Total HBM traffic per (batch, head) ≈ `2 × seqlen_kv × head_dim
+× 2 bytes`. For `seqlen_kv = 4096, head_dim = 128`: 2 MiB per (batch,
+head), ~256 MiB across the 256 blocks.
+
+If the kernel were bandwidth-bound and pulled at HBM peak (1008 GB/s),
+this would take 256 MiB / 1008 GB/s = ~0.25 ms.
+
+Measured: **1.669 ms**. So we're at ~256 MiB / 1.669 ms ≈ 153 GB/s
+effective bandwidth, or 15% of HBM peak.
+
+Not bandwidth-bound. Not compute-bound either (the per-iter ops are
+trivial — 128 FMAs per `j`, much less than the SM's compute capacity).
+
+So: **dependency-chain-bound**. The per-`j` chain is `K load → block
+reduce (with 2 syncs) → shmem write`. Two `__syncthreads()` per j ×
+4096 j's = 8192 sync barriers per block. *That's* where the time
+goes.
+
+### Result
+
+**1.669 ms / 80 GB/s achieved KV bandwidth** at the reference workload.
+Max |abs diff| vs the fp32 reference is 6e-5 (well within the
+`rtol/atol = 2e-2` correctness gate). 2.26× faster than PyTorch eager
+(3.77 ms); 23% behind PyTorch SDPA (1.36 ms).
+
+This is our **CUDA-vs-CUDA baseline**. Everything from here on is
+relative to v0.
+
+> **Checkpoint 3.1**
+> - In v0, why do we need shared memory for the score vector? What
+>   would happen if we just kept the partial scores in registers
+>   per-thread?
+> - What's the per-`j` dependency chain in v0? How many cycles is it
+>   roughly (count the syncs)?
+> - The kernel hits 15% of HBM peak. Is v0 bandwidth-bound? Use
+>   §2.8's framework to argue.
+
+---
+
+## 3.2 The online softmax trick (Milakov–Gimelshein 2018)
+
+Before we modify v0, we need to learn the math that powers v1 and
+everything after. This is the *single most important algorithmic
+trick* in modern attention kernels — every FlashAttention paper builds
+on it.
+
+### The problem with v0
+
+v0 has three sequential passes over the score vector:
+1. Phase 1 builds `s_smem`.
+2. Phase 2 reads `s_smem` to find max + sum exp.
+3. Phase 3 reads `s_smem` again (now as `p`) to compute output.
+
+That's *three passes over an `seqlen_kv`-sized array in shmem*. It
+also means `seqlen_kv` is capped by shared memory — at the 48 KiB
+default we can't go past ~12k positions. For long context (32k+
+tokens), this doesn't scale.
+
+We want **one pass**. But softmax is a non-local operation: the
+denominator `Σ exp(s[j] − max)` depends on `max(s)`, which needs to
+see all of `s` first. Or does it?
+
+### The recurrence
+
+Suppose we're processing `s[j]` one at a time and we have, so far:
+- `m` = max of `s[0..j-1]`
+- `l` = `Σ_{j' < j} exp(s[j'] − m)`
+- `o_acc[d]` = `Σ_{j' < j} exp(s[j'] − m) · V[j', d]`
+
+Now a new score `s_j` comes in. Two cases:
+
+**Case 1:** `s_j ≤ m`. Then `m` stays the same. We just update:
+```
+l         += exp(s_j − m)
+o_acc[d]  += exp(s_j − m) · V[j, d]
+```
+
+**Case 2:** `s_j > m`. The max changes. Let `m_new = s_j` (or in
+general, `max(m, s_j)`). Our existing `l` and `o_acc` were computed
+relative to the *old* `m`, so they're out of date. We rescale them:
+```
+m_new     = max(m, s_j)
+α         = exp(m − m_new)           // rescale factor for old contributions
+l_new     = l · α + exp(s_j − m_new)
+o_acc[d]  = o_acc[d] · α + exp(s_j − m_new) · V[j, d]
+m         = m_new
+```
+
+Case 1 is just case 2 with `m_new = m`, so `α = exp(0) = 1` and the
+rescale is a no-op. We can use the case-2 formula always:
+
+```
+For each j in 0..seqlen_kv:
+    m_new = max(m, s_j)
+    α     = exp(m - m_new)
+    l     = l · α + exp(s_j - m_new)
+    o_acc[d] = o_acc[d] · α + exp(s_j - m_new) · V[j, d]
+    m     = m_new
+
+At end: o[d] = o_acc[d] / l
+```
+
+That's the **online softmax recurrence**. Single pass over `j`, no
+shmem score buffer needed. The state per (batch, head) is just three
+scalars (`m`, `l`, plus per-thread `o_acc[d]`) in registers.
+
+### Why this works numerically
+
+The exponent argument `s_j − m_new` is always `≤ 0` (since
+`m_new ≥ s_j`), so `exp(...) ≤ 1`. No overflow. The rescale `α =
+exp(m − m_new) ≤ 1` only shrinks old contributions, never blows them
+up.
+
+Compare to the "naive" softmax `exp(s_j) / Σ exp(s_j)`: with large
+`s_j` (which happens in attention because of the dot product) you'd
+overflow `exp` instantly. The max-subtraction is what makes softmax
+numerically stable in practice.
+
+### Initialisation
+
+At `j = 0`:
+- Start `m = -∞`, `l = 0`, `o_acc = 0`.
+- First iteration: `m_new = max(-∞, s_0) = s_0`. `α = exp(-∞ - s_0) =
+  0`. `l = 0 · 0 + exp(0) = 1`. `o_acc = 0 · 0 + 1 · V[0, :] = V[0, :]`.
+
+Self-consistent. The first `j` becomes the running state.
+
+> **Checkpoint 3.2 (load-bearing!)**
+> Without looking, write the online softmax recurrence on paper. Five
+> assignments: `m_new`, `α`, `l`, `o_acc[d]`, `m`. You'll re-derive
+> this many times in the rest of Part 3.
+
+---
+
+## 3.3 v1 (naive port) — the regression
+
+### Hypothesis
+
+We have the math. Let's just port it into v0's structure.
+
+**Predicted outcome**: One pass over KV (no Phase 2 separate softmax,
+no Phase 3 separate output reduction), no shmem score buffer needed.
+*Should* be faster than v0 — strictly less work.
+
+### Implementation sketch
+
+Block geometry: same as v0 (`grid(batch, n_heads), block(head_dim)`).
+Each thread still owns one output lane `d`.
+
+The body:
+```
+m_state[d] = -inf
+l_state[d] = 0
+o_state[d] = 0       // per-thread, one fp32 register
+
+for j in 0..seqlen_kv:
+    // Block-wide dot product: same as v0 Phase 1's per-j step
+    partial = q[d] · K[j, d]
+    s_j     = scale · warp_reduce_sum(partial) ... block reduce ...
+    __syncthreads()                // sync to broadcast s_j to all threads
+    s_j     = s_bcast              // every thread reads broadcasted s_j
+
+    // Online softmax recurrence (every thread runs it in lockstep)
+    m_new  = max(m_state, s_j)
+    α      = exp(m_state - m_new)
+    p_j    = exp(s_j - m_new)
+    o_state = o_state · α + p_j · V[j, d]
+    l_state = l_state · α + p_j
+    m_state = m_new
+
+out[d] = (half) (o_state / l_state)
+```
+
+### Result
+
+**2.078 ms / 65 GB/s — 0.80× of v0.** Regression. Same hardware, same
+math, supposedly less work, slower.
+
+### Diagnosing the regression — the wrong hypothesis
+
+First hypothesis (mine when this happened): "every thread runs the
+same softmax recurrence redundantly. With 128 threads doing the same
+scalar work, we're wasting compute. Let's move the recurrence to one
+thread and broadcast."
+
+**Tested.** Moved `(m, l, α, p_j)` to lane 0 of warp 0, with shmem
+broadcast.
+
+**Result of the fix**: **2.26 ms — worse**.
+
+Why? §2.4 explains it: SIMT-parallel ALU is free. The 128 threads
+weren't "wasting compute" — they were going to sit at the
+`__syncthreads()` barrier anyway. Doing identical scalar arithmetic
+alongside cost nothing. *Moving* the work to one lane introduced
+serialization where there was none (only lane 0 active during the
+recurrence, 31 other lanes in the warp idle), AND added shmem hops
+for the broadcast.
+
+**Lesson 1 (load-bearing)**: when you remove "redundant" work, ask:
+*were the redundant threads doing nothing useful otherwise?* If yes,
+the work was free, and "removing" it makes things worse.
+
+### Diagnosing the regression — the right hypothesis
+
+Look more carefully at v1's per-`j` chain:
+
+```
+1. Load K[j, d]                                    HBM/L2 read
+2. Compute partial = q[d] · K[j, d]                  FMA
+3. warp_reduce_sum + cross-warp shmem reduce        ~10 cycles + sync
+4. __syncthreads()                                   sync (load barrier!)
+5. Load broadcast s_j                                shmem read
+6. exp(m_state - m_new), exp(s_j - m_new)            2× expf, ~10 cycles each
+7. Load V[j, d]                                      HBM/L2 read         ← latency hidden by ???
+8. FMA o_state += p_j · V[j, d]                      FMA
+9. Update m, l, m_state                              ~3 ops
+10. Next iter
+```
+
+Step 7 — the V load — is *inside the per-iter dependency chain after the
+`__syncthreads()`*. Recall §2.6: nvcc treats `__syncthreads()` as a
+*load barrier* — it cannot hoist a load above it. So V latency
+(hundreds of cycles for an HBM/L2 miss) sits as a single sequential
+step in the chain.
+
+In v0, V loads happened in Phase 3, *outside* any per-j sync. Phase 3's
+loop body was just `o += s_smem[j] · V[j, d]` — no syncs, so the
+compiler aggressively pipelined V loads. Latency hidden.
+
+In v1, V loads sit inside the sync. **Latency exposed.**
+
+### The fix: prefetch V
+
+Issue the V load *at the top of the iteration*, before any sync. The
+load is non-blocking; the value isn't consumed until later. Latency
+hides behind everything else in the chain.
+
+```
+for j in 0..seqlen_kv:
+    v_j_register = V[j, d]            // ← load issued NOW, asynchronously
+    // ... K load, reduce, sync, softmax ...
+    o_state = o_state · α + p_j · v_j_register
+```
+
+That's it. One line moved.
+
+### Result with prefetch (commit `ad9c57f`)
+
+**1.637 ms / 82 GB/s — 1.02× over v0.** Online softmax now does what
+theory predicts: roughly tied with the two-pass version, with the
+structural wins of single-pass and unbounded `seqlen_kv`.
+
+### What we learned
+
+**Lesson 2 (load-bearing)**: `__syncthreads()` is also a *load barrier*.
+nvcc won't hoist memory loads above it. If a load is on the per-iter
+critical path *after* a sync, it serialises with the chain. The fix is
+manual: move the load before the sync, into a register, and use it
+after.
+
+This lesson recurs:
+- In v5, we'll try `cp.async` (explicit async loads) — but for
+  different reasons than what bit us here.
+- In the Phase 3 W4A16 GEMM, we won't have the sync barrier problem
+  because we don't need cross-warp sync at all.
+
+> **Checkpoint 3.3**
+> - In v1's per-iter chain, where exactly does the V load sit
+>   relative to the `__syncthreads()`?
+> - If the V load latency is ~500 cycles and the rest of the chain is
+>   ~50 cycles, what's v1's per-iter cost (in cycles) without the
+>   prefetch fix? With it?
+> - The "redundant exp" fix made v1 *slower*. State why in one sentence
+>   referencing §2.4.
+
+---
+
+## 3.4 v2 — single-sync block reduce
+
+### What's left to remove
+
+v1 with prefetch has **two `__syncthreads()` per iter**:
+- One after each warp writes its partial dot-product to `reduce_smem`
+  (so warp 0 can read them all).
+- One after warp 0 writes the final `s_j` to a broadcast slot (so all
+  warps can read it).
+
+Two syncs per iter × 4096 iters = 8192 sync barriers per block. Can we
+get to one?
+
+### Two-part hypothesis
+
+**Part A — Make every warp redundantly compute the final reduce.**
+Instead of warp 0 doing the final reduction and then broadcasting via
+shmem, have every warp read all four partial values from
+`reduce_smem` (4 floats — one per warp) and run its own
+`warp_reduce_sum`. SIMT means every lane in every warp gets the same
+answer with no shmem round-trip.
+
+Why is this free? The other warps were going to sit at the second
+`__syncthreads()` anyway. Having them do four shmem reads and a 5-step
+shuffle reduction costs nothing wall-clock-wise (SIMT lesson again).
+
+**Part B — Double-buffer the `reduce_smem`.**
+Without part A, dropping one sync would create a race: iter `j+1`'s
+write to `reduce_smem` could clobber iter `j`'s reads in slower warps.
+
+Fix: use two slots in `reduce_smem` (size `[2][4]`). Iter `j` writes
+slot `j & 1` and reads slot `j & 1`. Iter `j+1` writes the *other*
+slot. The hazard between iter `j`'s read and iter `j+2`'s write (same
+slot) is gated by iter `j+1`'s sync — there's always a sync between
+them.
+
+So: each iter writes its slot, syncs once, reads its slot, computes.
+**One sync per iter.**
+
+### Implementation sketch
+
+```
+__shared__ float reduce_smem[2][32];    // 2 slots × WARP_SIZE entries
+
+for j in 0..seqlen_kv:
+    v_j = V[j, d]                                    // prefetch (v1 lesson)
+    partial = q[d] · K[j, d]
+    partial = warp_reduce_sum(partial)
+    if lane_id == 0:
+        reduce_smem[j & 1][warp_id] = partial         // double-buffered write
+    __syncthreads()                                   // one sync per iter
+    // Every warp reads all 4 partials and reduces:
+    r = (lane_id < 4) ? reduce_smem[j & 1][lane_id] : 0
+    r = warp_reduce_sum(r)
+    s_j = r · softmax_scale
+    // ... online softmax + V FMA (same as v1) ...
+```
+
+### What we predicted vs measured
+
+**Prediction**: one fewer `__syncthreads()` per iter. With each sync
+costing ~50 cycles (rough estimate), 4096 iters × ~50 cycles ≈ 200k
+cycles per block ≈ 150 µs saved.
+
+**Measured**: **1.069 ms** (vs v1-prefetch's 1.637 ms). Saved **570
+µs**.
+
+What gives? We predicted ~150 µs of sync savings; we got ~570 µs.
+
+### The shmem-hop lesson
+
+The extra savings came from removing the *broadcast* shmem write/read,
+not just the sync. In v1:
+```
+s_j = shfl_tree → write to broadcast_smem → SYNC → all threads read broadcast_smem → use s_j
+```
+
+In v2:
+```
+s_j = shfl_tree → directly into register → use s_j
+```
+
+That's one shmem write + one shmem read removed from the *critical
+path*. Shmem accesses are ~20 cycles each; with 4096 iters, removing
+two shmem ops per iter ≈ 160k cycles ≈ 60 µs.
+
+Plus the sync removal: 150 µs.
+
+Plus reduced instruction count + better scheduling around the
+shorter chain. The combined gain is more than the sum of the parts —
+which is what happens when you shorten a critical path: everything
+that was bottlenecked on it becomes faster.
+
+### What we learned
+
+**Lesson 3 (load-bearing)**: removing a sync from the inner loop often
+saves more than the sync's own cycles. The chain shortens; the chain's
+*consequences* (instruction scheduling, in-flight load count limits,
+warp slot pressure) all loosen. **Look at the chain, not the sync.**
+
+### Result
+
+**1.069 ms / 126 GB/s — 1.53× over v1-prefetch, 1.56× over v0.** Now
+1.27× faster than PyTorch SDPA on this workload.
+
+> **Checkpoint 3.4**
+> - In v2's per-iter chain, how many sync barriers are there now?
+> - Why does double-buffering `reduce_smem` allow us to drop a sync?
+>   (Hint: race condition between iters.)
+> - The actual speedup (~570 µs saved) was larger than predicted
+>   (~150 µs from sync alone). What accounts for the rest?
+
+---
+
+## 3.5 v3 — vectorized loads + single-warp blocks
+
+### The bet
+
+v2 is at 126 GB/s on a 1008 GB/s HBM peak. Still 13% of peak. The
+remaining bottleneck must still be the chain — not bandwidth.
+
+Two things might shorten the chain further:
+1. **Vectorize the K and V loads** — load 4 fp16 values per LDG.E.64
+   (one uint2 = 8 bytes) instead of one LDG.E.16 (2 bytes). Fewer load
+   instructions per iter.
+2. **Eliminate cross-warp sync entirely** — make the block one warp.
+   Then there's no `__syncthreads()` needed at all (warp internal
+   communication via shuffle is sync-free).
+
+But going to single-warp blocks means: each thread owns 4 d-lanes
+(`head_dim / 32 = 4`) instead of 1. Per-thread work 4×. Per-block
+warp count drops from 4 to 1 — **occupancy drops from full (48 warps/SM)
+to ~33%**.
+
+### The occupancy concern
+
+§2.5 says: lower occupancy means less latency hiding. With 33%
+occupancy, fewer warps are resident to fill in while one stalls on a
+memory load.
+
+The bet: **the lost latency hiding doesn't matter because the chain
+ceiling is what's bottlenecking us anyway.** Those extra warps in v2
+weren't hiding latency — they were sitting at `__syncthreads()`. Trade
+their slots for shorter chain.
+
+### Implementation sketch
+
+```
+constexpr int VEC = 4;                  // 4 fp16 per thread per load = LDG.E.64
+
+Block: 32 threads (= 1 warp).
+Each thread owns lanes [tid*4 .. tid*4+3] (4 d-lanes).
+
+q is loaded once at start as a float4 (4 fp16 from HBM → 4 fp32 in registers).
+
+for j in 0..seqlen_kv:
+    v_j = load_half4_as_float4(&V[j, tid*4])         // ← prefetch (v1 lesson)
+    k_j = load_half4_as_float4(&K[j, tid*4])
+    partial = q.x·k_j.x + q.y·k_j.y + q.z·k_j.z + q.w·k_j.w
+    partial = warp_reduce_sum(partial)               // single-warp = no sync!
+    s_j = partial · scale
+    // online softmax + V FMA on 4 lanes:
+    α = exp(m_state − m_new); p_j = exp(s_j − m_new)
+    o_state.x = o_state.x · α + p_j · v_j.x
+    o_state.y = o_state.y · α + p_j · v_j.y
+    o_state.z = o_state.z · α + p_j · v_j.z
+    o_state.w = o_state.w · α + p_j · v_j.w
+    l_state = l_state · α + p_j
+    m_state = m_new
+
+write 4 output lanes via store_float4_as_half4
+```
+
+Note: zero `__syncthreads()`. Zero shared memory. Just registers and
+warp shuffles.
+
+### Result
+
+**0.713 ms / 189 GB/s — 1.50× over v2, 2.34× over v0, 1.91× faster
+than PyTorch SDPA.** Max |abs diff| = 3e-5.
+
+The bet paid off. The 33% occupancy was fine because the lost warps
+were idle at syncs anyway.
+
+### Why the win this time?
+
+Three things stacked:
+1. **No `__syncthreads()`** — chain shortened by the entire sync
+   barrier (~50 cycles), every iter.
+2. **No shmem at all** — no reduce_smem, no broadcast slot.
+   register-to-register all the way.
+3. **Wider per-thread loads** — vectorized K/V means fewer load
+   instructions per iter (4 fp16 in one LDG.E.64 vs 4 LDG.E.16s).
+
+### What we learned
+
+**Lesson 4**: occupancy is a means, not an end. Phase 1 v0 was at full
+occupancy (48 warps/SM) and was slow. v3 is at 33% and is fast. The
+question isn't "how many warps fit?" — it's *"are we using them for
+something the kernel actually waits on?"*
+
+For dependency-chain-bound kernels, the answer is no — they wait on
+chain dependencies, not on parallel memory ops. So trading occupancy
+for shorter chain is a win.
+
+> **Checkpoint 3.5**
+> - In v3, how many threads per block? How many warps?
+> - Why doesn't v3 need any `__syncthreads()`?
+> - State the v3 trade-off in one sentence, using §2.5's vocabulary.
+
+---
+
+## 3.6 v4 — split-K (FlashDecoding) — **regression**
+
+### The hypothesis
+
+v3 launches 256 blocks (8 batch × 32 heads). At 33% occupancy with
+some hardware-fit-math, it uses about 16 SMs out of 128. **Only 12% of
+the GPU is busy.**
+
+The textbook fix for grid under-utilization is **split-K** (called
+FlashDecoding in the attention context): split each (batch, head)
+pair's work across multiple blocks along the KV sequence dimension.
+8× split-K gives 8× more blocks (2048 instead of 256), nominally
+filling the GPU.
+
+Each split-block handles `seqlen_kv / K_SPLIT` j-positions and
+produces a partial `(m, l, o_acc)`. A small second kernel combines the
+K_SPLIT partials into the final output.
+
+### Why it should work — in theory
+
+If bandwidth or compute is the ceiling, more SMs busy means more total
+throughput. Going from 16 → 128 SMs busy should help dramatically.
+
+### Why it didn't work — in practice
+
+**Measured: 0.802 ms (vs v3's 0.713 ms). 0.89× — regression.**
+
+The diagnosis: v3 wasn't actually grid-bound. At 16 SMs busy with
+~24 blocks/SM, the *per-SM bandwidth* was the ceiling. Each SM was
+already at its individual L1/L2 throughput limit reading K and V
+from the cache.
+
+Adding more SMs doesn't help when **the shared resource is the
+ceiling**. Going from 16 → 86 SMs means each SM now has fewer
+blocks (more SMs, same total) and the per-SM bandwidth pressure drops
+— but the *total* bandwidth across all SMs is still limited by HBM
+and L2 caps, which were not the ceiling before.
+
+Meanwhile, split-K added:
+- A second kernel launch (~10 µs).
+- Scratch memory allocation for partials (~5 µs).
+- The combine kernel's own work.
+- Extra HBM writes (partials) + reads (in combine).
+
+Net: ~250 µs of fixed overhead.
+
+### What we learned
+
+**Lesson 5 (load-bearing)**: don't add parallelism where the
+bottleneck isn't compute or per-SM bandwidth. Adding SMs busy is only
+a win if the *aggregate* of (more SMs × per-SM-throughput) gives more
+*throughput on the bottlenecked resource*. If the bottleneck is the
+per-iter chain (which doesn't speed up with more SMs), more SMs is
+pure overhead.
+
+This is symmetric to lesson 3 (chain trumps sync): both say *attack
+the actual bottleneck, not the shape that resembles a textbook one*.
+
+### Decision
+
+The v4 split-K code was committed for reference (commit `f904aae`),
+then reverted in `e39c97f`. `main` stays on v3.
+
+> **Checkpoint 3.6**
+> - In §2.8's framework, was v3 bandwidth-bound or chain-bound? What
+>   evidence supports your answer?
+> - Why does split-K help in some workloads but hurt in v3's?
+> - When *would* you reach for split-K? (Hint: think about per-SM
+>   resource pressure.)
+
+---
+
+## 3.7 v5 — cp.async double-buffering — **regression**
+
+### The hypothesis
+
+v3 hides V latency via the prefetch trick (load V at the top of the
+iter, use it at the bottom). But the prefetch is just *a hint to nvcc*:
+the actual load still goes through the regular memory path, and we
+have no control over how many loads are in flight.
+
+`cp.async` (Ampere+) lets you issue asynchronous global → shared memory
+copies. The thread continues executing while the copy proceeds in the
+background. With double-buffering, you can have one tile of K/V being
+copied while the previous tile is being consumed — explicit
+prefetching with controlled depth.
+
+In theory: **deeper prefetch pipeline → more in-flight loads → better
+memory latency hiding.**
+
+### Why it didn't work
+
+**Measured: 0.760 ms (vs v3's 0.713 ms). 0.94× — regression.**
+
+The problem:
+- `cp.async` writes to *shared memory*, not registers. v3 went
+  `HBM → register → use`. v5 goes `HBM → shmem → register → use`. The
+  extra shmem hop costs cycles on every iter (shmem write + shmem
+  read).
+- v3's prefetch was already capturing most of the available latency
+  hiding through nvcc's compiler scheduling. There wasn't much room
+  for explicit pipelining to add on top.
+
+Net: paid the shmem-hop cost (~50 µs across 4096 iters), gained
+~nothing in latency hiding.
+
+### What we learned
+
+**`cp.async` is the right tool when:**
+- Per-iter compute is heavy enough to amortize the shmem hop. (e.g.,
+  prefill attention with Tensor Cores, big GEMMs.)
+- Compiler-scheduled prefetching can't capture enough latency hiding.
+
+**For decode attention v3, neither applies.** The per-iter chain is
+short and nvcc's prefetch is already good enough.
+
+### Decision
+
+v5 also committed (`78a28ff`) and reverted (`4254ce2`). `main` stays
+on v3.
+
+> **Checkpoint 3.7**
+> - Why does `cp.async` write to shared memory, not registers?
+> - What's the structural difference between v1's prefetch fix and v5's
+>   cp.async approach? Why does one help and the other hurt?
+> - State the conditions under which `cp.async` would help, in one
+>   sentence each.
+
+---
+
+## 3.8 The shape of the journey
+
+| Step | Latency | BW | Lesson |
+|------|---------|-----|--------|
+| **v0** naive two-pass | 1.669 ms | 80 GB/s | The chain has 2 syncs per `j`. Baseline. |
+| **v1 naive** (regression) | 2.078 ms | 65 GB/s | V load inside the sync = exposed latency. Wrong fix attempted. |
+| **v1 prefetch** (fix) | 1.637 ms | 82 GB/s | Hoist V load above the sync manually. |
+| **v2** single-sync reduce | 1.069 ms | 126 GB/s | Drop one sync via double-buffer + redundant cross-warp reduce. Shmem hop removal stacks. |
+| **v3** vec + 1-warp | **0.713 ms** | **189 GB/s** | Trade occupancy for chain. Won big. |
+| v4 split-K (regression) | 0.802 ms | 167 GB/s | More SMs doesn't help when per-SM bandwidth is the ceiling. |
+| v5 cp.async (regression) | 0.760 ms | 177 GB/s | Explicit async loads cost more than nvcc's prefetch already gives. |
+
+## 3.9 Five lessons to take with you
+
+1. **SIMT-parallel ALU work is essentially free.** When warps would
+   otherwise wait at a sync, having them do identical scalar work is
+   free. Moving work to one lane to "save" it often makes things
+   worse (v1 wrong-hypothesis detour).
+
+2. **`__syncthreads()` is a load barrier.** nvcc won't hoist a memory
+   load above it. If a load is on the per-iter critical path after a
+   sync, its latency serialises with the chain. Move the load manually
+   above the sync (v1 prefetch fix).
+
+3. **Removing a shmem hop can dwarf removing a sync.** v2 saved ~570 µs
+   from a change predicted to save only ~150 µs. The chain shortened in
+   more ways than just the visible barrier.
+
+4. **Occupancy is a means, not an end.** v3 traded full occupancy for
+   single-warp blocks and won 1.5×. The lost warps were idle at sync
+   barriers in v2, not doing useful latency hiding.
+
+5. **Don't add parallelism where the bottleneck isn't compute.** v4
+   split-K added 5× more busy SMs but each SM was still at its
+   per-iter chain limit. More SMs ≠ more throughput when the chain
+   is the ceiling. Same lesson for v5: don't fix latency hiding when
+   it's not the bottleneck.
+
+## 3.10 Closing thoughts
+
+Part 3's central trick is to apply **the same framework** at every
+step:
+
+1. *Where's the bottleneck?* Use §2.8 (bandwidth / compute / chain).
+2. *What lever shortens that specifically?* §2.7 (the chain), or §2.3
+   (memory hierarchy), or §2.5 (occupancy).
+3. *Predict the magnitude.* If your prediction is off by 4×, you're
+   missing something — go look at the chain again.
+
+We landed at **v3: 0.713 ms / 189 GB/s — 1.91× over PyTorch SDPA**
+through five iterations and two reverts. Every step in the table
+above is on a separate branch (`v0`, `v1-naive`, `v1`, `v2`, `v3`,
+`v4`, `v5`) — check them out, rebuild, run the bench, and feel the
+numbers in your hands.
+
+Part 4 (KV-cache compression) and Part 5 (cross-cutting lessons)
+build on these foundations. By the end of the book, you should be
+able to look at any new GPU kernel and walk through Parts 2's
+diagnostic and Part 3's pattern-matching without referring back.
+
+---
+
+**Ready for Part 4?** Part 4 covers KV-cache compression: the math of
+symmetric integer quantization, why per-channel K + per-token V (KIVI)
+is the right recipe, scale-folding via linearity in the INT8 kernel,
+and the structural per-group K-scale trick that makes INT4 actually
+*faster* than fp16 (where INT8 was a tie).
+
+Before continuing, work checkpoints 3.2 (online softmax) and 3.4
+(v2's sync removal) cold. They're the math/structural pair you'll
+extend in Part 4.
