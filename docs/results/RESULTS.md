@@ -107,11 +107,55 @@ HBM traffic (small M), 4× less weight bytes ≈ proportional latency win.
   no `act` shmem caching. L1 catches the act reuse across the 32
   threads in a block but not across blocks.
 
-### Phase 3c — optimized decode W4A16 GEMM
+### Phase 3c — decode-optimized W4A16 GEMM (M=1 fast path)
 
-| Shape (K, N)   | M  | Commit | cuBLAS fp16 | w4a16 v1 | Speedup |
-|----------------|---:|--------|------------:|---------:|--------:|
-| _TBD_ |  1 | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+Two changes vs 3b:
+
+1. **Multi-warp block + K-split.** Block grows from 1 warp to 4 warps
+   (128 threads). The 32 columns are still owned by one warp's 32
+   lanes — but K is split across the 4 warps: each warp processes
+   `K/4` of the reduction for all 32 columns. After the K loop, a
+   tiny shmem combine sums the 4 per-warp partials per column. This
+   gives both per-block speedup (more compute throughput per block)
+   and better grid coverage at small N (4× the warp count per kernel).
+2. **`act` in shared memory.** The K activation vector is loaded once
+   per block into shmem at kernel start (cooperative across the 128
+   threads), then read from shmem in the inner loop. Frees L1 for the
+   weight traffic.
+
+Fast path applies only at M=1. M>1 falls back to the 3b naive kernel
+via the launcher dispatch — 3c is decode-specialized; batched-decode
+M>1 is integration concern (Phase 4).
+
+| Shape (K, N)   | M | Commit | cuBLAS fp16 | w4a16 decode | Speedup |
+|----------------|--:|--------|------------:|-------------:|--------:|
+| 4096 × 4096 (attn QKV / O)    | 1 | _HEAD_ | 0.047 ms | **0.016 ms** | **2.88×** |
+| **4096 × 14336 (MLP up/gate)**| 1 | _HEAD_ | 0.134 ms | **0.019 ms** | **6.97×** |
+| 14336 × 4096 (MLP down)        | 1 | _HEAD_ | 0.133 ms | **0.045 ms** | **2.96×** |
+
+All three M=1 Llama 3 8B linear-layer shapes clear the Phase 3 *Target*
+(2–3× over fp16 cuBLAS) at M=1. MLP up/gate clears it by ~3.5×.
+
+**Why each shape improved over 3b** (per Phase 3 journey notes):
+
+- **4096 × 4096** (3b: 0.53×, 3c: 2.88× — **5.4× improvement**): 3b had
+  only 128 single-warp blocks → ~1 warp per SM, severe under-occupation.
+  3c's 4-warp blocks give 512 warps total — 4 warps/SM, meaningful for
+  latency hiding.
+- **4096 × 14336** (3b: 1.59×, 3c: 6.97× — **4.4× improvement**): 3b
+  already won via grid coverage. 3c additionally cuts per-thread K work
+  4× and adds act caching.
+- **14336 × 4096** (3b: 0.47×, 3c: 2.96× — **6.3× improvement**): 3b's
+  worst loss was here — long K serialised through one thread. K-splitting
+  brought per-thread K from 14336 to 3584.
+
+**vs Marlin (SOTA)**: not yet measured. The 6.97× win on MLP up/gate
+puts us in the right neighbourhood for the docs/03 *Target* of "within
+25% of Marlin"; full comparison deferred to a follow-up.
+
+M > 1: still falls back to the naive kernel. The bench numbers above
+show the gap (worsens linearly with M); a batched-decode-optimized
+variant would need M-fast inner loops and is a Phase 4 concern.
 
 ## End-to-end (Phase 4)
 
