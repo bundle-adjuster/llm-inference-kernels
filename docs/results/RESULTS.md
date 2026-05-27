@@ -181,7 +181,7 @@ reference (10 prompts × 64 new tokens) is committed at
 | **vanilla HF** (Phase 4 baseline) | `phase4-eval-prep` | 335.8 | 1.00× | 0.48× | 18.50 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + fused attention (4a) | `phase4-attention` | 344.1 | 1.025× | 0.49× | 18.57 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | 521.7 | 1.55× | 0.74× | 18.41 GB | 7.256 | 0.5047 | 67.29% | 79.07% | 61.43% |
-| + W4A16 weights (4c) | `phase4-w4a16` | 40.9 | 0.12× | 0.06× | 9.05 GB | 8.087 | 0.2672 | 62.40% | 77.51% | 55.72% |
+| + W4A16 weights (4c, Phase 5 kernel) | `phase4-w4a16` + `phase5-batched-w4a16` | 199.9 | 0.60× | 0.28× | 9.05 GB | 8.087 | 0.2672 | 62.40% | 77.51% | 55.72% |
 | + W4A16 weights (4c) | `phase4-w4a16` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | vanilla vLLM (ref) | _ | 703.2 | 2.09× | 1.00× | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -312,3 +312,24 @@ reference (10 prompts × 64 new tokens) is committed at
   is a clean Phase 5 follow-up; the Phase 4c integration proves the rest
   of the plumbing (quant offline, packed loading, forward dispatch, accuracy
   characterization) is correct and ready for that next step.
+
+**Phase 5 update** (batched-decode kernel; `phase5-batched-w4a16`).
+The 4c row above now reflects the Phase 5 result (the `w4a16_gemm`
+launcher routes M∈[2, 16] through `w4a16_gemm_batched_decode_kernel`).
+Numbers vs Phase 4c-as-committed (M=1 design point only):
+
+| Phase 4c at batch=16 | tok/s | Notes |
+|---|---:|---|
+| M=1 kernel only (commit `8882880`) | 40.9 | M=16 falls back to v0 naive — 16× weight bandwidth amplification |
+| + Phase 5 batched-decode kernel | **199.9** | **4.9× recovery; 0.60× vs vanilla HF (still gap to cuBLAS — tensor cores) ** |
+
+The Phase 5 kernel is correct (max abs err 0.25, mean rel 0.001 — same
+fp16 reduction-order noise as the M=1 kernel) and amortizes weight
+bandwidth across `BLOCK_M=16` rows as designed — at M ∈ [2, 16] it
+runs in a near-flat 200 µs/call (the work is BLOCK_M-sized regardless
+of actual M). It still loses to cuBLAS at M=16 by ~1.7× because cuBLAS
+uses **tensor cores** (fp16 MMA throughput) while ours uses scalar
+fp32 FMA accumulators. At RTX 4090's ~82 TFLOPs fp32 vs ~165 TFLOPs
+fp16 MMA, that's the residual gap; closing it would require an
+`mma.sync`-based rewrite, the natural Phase 6 follow-up. Memory
+savings (51% peak VRAM) and accuracy numbers are unchanged.
