@@ -116,15 +116,51 @@ decode shapes — landed at 2.88×–6.97×).
 
 ## Phase 4 — End-to-end integration & presentation
 
-- [ ] Monkeypatch Llama 3 8B (HF) to call the custom attention + GEMM kernels
-- [ ] Enable KV-cache compression in the patched model
-- [ ] End-to-end tokens/sec + peak memory vs vanilla vLLM, same workload
-- [ ] Quality eval: perplexity / chat eval with compression on
-- [ ] Generate roofline plots + `ncu`/`nsys` summary figures
-- [ ] Fill the README results table
+Approach: monkeypatch HF Llama 3.1 8B Instruct one kernel at a time, on its
+own branch, with full eval per step (the GPTQ/AWQ/KIVI paper bar — MMLU 5-shot,
+HellaSwag 0-shot, ARC-Challenge 25-shot, plus WikiText-2 PPL, greedy-token
+match rate, decode tokens/sec, peak VRAM). Each integration step gets its own
+RESULTS.md row so the accuracy/latency/memory tradeoff is attributable.
+
+### 4-prep. Eval infrastructure (branch `phase4-eval-prep`)
+- [ ] Install `lm-evaluation-harness`; smoke-test on Llama 3.1 8B Instruct
+- [ ] `scripts/run_lm_eval.py`: wrapper for MMLU/HellaSwag/ARC-C
+- [ ] `scripts/run_e2e_eval.py`: WikiText-2 PPL + greedy-token-match + tokens/sec + peak VRAM
+- [ ] Run vanilla Llama 3.1 8B Instruct baseline; lock numbers in `docs/results/lm_eval/vanilla.json` and `docs/results/e2e_eval/vanilla.json`; first Phase 4 row in RESULTS.md
+- [ ] Save vanilla greedy-reference token outputs (used by 4a–4c match rate)
+- [ ] Merge `phase4-eval-prep` → `main`
+
+### 4a. Attention kernel integration (branch `phase4-attention`)
+- [ ] Monkeypatch `F.scaled_dot_product_attention` (same hook as `eval_perplexity.py`): dispatch our Phase 1 v3 `decode_attention` for `q_len == 1` (decode), fall back to the original SDPA for prefill
+- [ ] Greedy-match on 10 fixed prompts vs vanilla reference (catch integration bugs)
+- [ ] Full eval suite — lm-eval + e2e
+- [ ] RESULTS.md row + journey doc section
+- [ ] Merge → `main`
+
+### 4b. KV-cache compression integration (branch `phase4-kv-int4`)
+- [ ] Replace HF `DynamicCache` with an INT4 KIVI cache: per-channel groupwise K (group=32), per-token V, packed 4-bit
+- [ ] On append: quantize current-token K/V via our Phase 2 kernels
+- [ ] On read: dispatch our Phase 2 INT4 KIVI attention kernel for decode
+- [ ] Full eval suite — Δppl, Δ MMLU/HellaSwag/ARC-C, tokens/sec, peak VRAM
+- [ ] RESULTS.md row + journey doc section
+- [ ] Merge → `main`
+
+### 4c. W4A16 weight integration (branch `phase4-w4a16`)
+- [ ] Offline weight quantization script (`scripts/quantize_llama_weights.py`): symmetric INT4, group=128 along K, save packed + scales for each `q_proj`, `k_proj`, `v_proj`, `o_proj`, `up_proj`, `gate_proj`, `down_proj`
+- [ ] Patched linear layers using our Phase 3 `w4a16_gemm` for decode (M=1); fp16 fallback for prefill
+- [ ] Full eval suite — Δ accuracy on all metrics, tokens/sec, peak VRAM (~10 GB savings expected)
+- [ ] RESULTS.md row + journey doc section
+- [ ] Merge → `main`
+
+### 4d. Final headline + presentation (branch `phase4-wrapup` or directly on `main`)
+- [ ] `docs/04-end-to-end-integration-journey.md` — full Phase 4 narrative
+- [ ] Roofline plot + `ncu`/`nsys` summary figures
+- [ ] Fill README results table with final headline numbers
 - [ ] Distill RESULTS.md into a slide-ready interview summary
 
-**Exit criterion:** End-to-end *Target* met or a profiler-backed account of why.
+**Exit criterion:** End-to-end *Target* met or a profiler-backed account of
+why; accuracy tradeoff documented across all four eval metrics for each
+kernel.
 
 ---
 

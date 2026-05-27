@@ -1,0 +1,10 @@
+{
+  "config_name": "vanilla",
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "ppl": 7.0554,
+  "greedy_match_rate": 1.0,
+  "tokens_per_sec": 335.8,
+  "peak_vram_gb": 18.5,
+  "n_ppl_chunks": 64,
+  "ppl_chunk_size": 2048
+}
