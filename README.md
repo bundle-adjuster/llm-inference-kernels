@@ -63,7 +63,7 @@ Phase 3 W4A16 GEMM findings are in
 | Quantized matmul (W4A16) — MLP down (K=14336, N=4096, M=1) | fp16 W: 112 MiB | fp16 cuBLAS 0.133 ms | INT4 W: 28.88 MiB / **0.045 ms** | **0.26× memory** · **2.96× latency** | Phase 3c |
 | **E2E Phase 4a** — Llama 3.1 8B + fused attention | locked workload (batch=16, prompt=512, gen=512), greedy | vanilla HF 335.8 tok/s · 18.50 GB peak VRAM · MMLU 68.32% | **344.1 tok/s · 18.57 GB · MMLU 68.32%** | **+2.5% tok/s · bit-identical accuracy** | Phase 4a; attention bit-perfect (greedy_match=1.0). Small e2e gain because attention is ~4% of decode time at this workload |
 | **E2E Phase 4b** — + INT4 KIVI KV cache | same | vanilla as above | **521.7 tok/s · 18.41 GB · MMLU 67.29%** | **1.55× tok/s · −1.03 pp MMLU · Δppl +0.20** | Phase 4b; PPL delta matches Phase 2c's kernel-level number to within rounding; real INT4 cache class via HF Cache subclass |
-| **E2E Phase 4c** — + W4A16 weights (memory headline) | same | vanilla as above | 40.9 tok/s (B=16) / **56.9 tok/s (B=1)** · **9.05 GB peak VRAM** · MMLU 62.40% | **−51% peak VRAM (-9.45 GB) · 1.16× tok/s at B=1** · −5.92 pp MMLU | Phase 4c; 4c surfaces an M-awareness gap — the Phase 3 W4A16 kernel was M=1-only and the locked workload runs at M=16. Memory + B=1 wins land; B=16 latency awaits the Phase 5 batched-decode W4A16 kernel |
+| **E2E Phase 4c** — + W4A16 weights (memory headline) | same | vanilla as above | **199.9 tok/s (B=16, w/ Phase 5 kernel)** · 56.9 tok/s (B=1) · **9.05 GB peak VRAM** · MMLU 62.40% | **−51% peak VRAM (-9.45 GB) · 0.60× vs vanilla at B=16** · 1.16× tok/s at B=1 · −5.92 pp MMLU | Phase 4c + Phase 5; 4c initially regressed to 0.12× at B=16 because the Phase 3 W4A16 kernel was M=1-only. Phase 5 adds a batched-decode kernel (BLOCK_M=16, K-split across warps) that amortizes weight bandwidth across the batch — 4.9× recovery. Residual gap to cuBLAS is the tensor-core advantage (scalar fp32 vs fp16 MMA); closing it is a Phase 6 follow-up |
 
 ## Repo layout
 
@@ -163,6 +163,12 @@ Phase 3 kernel is M=1-only and the locked workload has M=16 — the
 batched-decode kernel is Phase 5. Full narrative in
 [`docs/04-end-to-end-integration-journey.md`](docs/04-end-to-end-integration-journey.md).
 
-**Phase 5 — batched-decode W4A16 kernel: next.** Build an M-aware
-W4A16 GEMM (Marlin-style: BLOCK_M × BLOCK_N output tile, weights loaded
-once and amortized across M) so 4c at batch=16 also wins.
+**Phase 5 — batched-decode W4A16 kernel: complete.** Added
+`w4a16_gemm_batched_decode_kernel` for `M ∈ [2, 16]` — same K-split-
+across-warps pattern as Phase 3c but each thread now accumulates a
+length-`BLOCK_M=16` vector of fp32 partials, and each warp has its own
+`[BLOCK_M, group_size]` activation tile in shmem so the int4 weight
+read is amortized across all M rows. **Phase 4c at batch=16 recovers
+from 40.9 to 199.9 tok/s (4.9× over the M=1-only baseline; 0.60× vs
+vanilla HF).** Residual gap is the tensor-core advantage cuBLAS holds
+at this M; an `mma.sync`-based rewrite is the natural Phase 6.

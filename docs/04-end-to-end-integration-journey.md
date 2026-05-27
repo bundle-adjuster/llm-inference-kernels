@@ -474,20 +474,81 @@ workload (batch=16, prompt=512, generate=512):
    "the patch is doing what you intended" before any of the slower
    evals run.
 
-## What's still open
+## Phase 5 addendum — batched-decode W4A16 kernel
 
-- **The Phase 4c batched-decode regression has a designed-in fix:** build
-  an M-aware W4A16 kernel with BLOCK_M tiling and tensor-core MMA. That's
-  Phase 5. After it lands, this journey doc gets an addendum with the
-  new 4c-at-batch=16 numbers.
+The Phase 4c regression had a designed-in fix; Phase 5 builds it.
+
+### What landed
+
+`w4a16_gemm_batched_decode_kernel` in `kernels/quant/quant_matmul.cu` —
+same K-split-across-warps pattern as the Phase 3c decode kernel, but each
+thread now accumulates a `BLOCK_M=16`-length vector of fp32 partials
+instead of a scalar. Each warp has its own `[BLOCK_M, group_size]`
+activation tile in shmem, loaded once per K group and reused across all
+inner-loop iterations. The launcher routes:
+
+```
+M == 1        → Phase 3c decode kernel  (unchanged)
+M ∈ [2, 16]   → Phase 5 batched-decode kernel
+M  > 16       → Phase 3b naive (prefill catch-all)
+```
+
+### Result — recovery, not a full win
+
+| Phase 4c at batch=16 | tok/s | vs vanilla HF | Note |
+|---|---:|---:|---|
+| M=1 kernel only (commit `8882880`) | 40.9 | 0.12× | M=16 falls to v0 naive: 16× weight read amplification |
+| **+ Phase 5 batched-decode kernel** | **199.9** | **0.60×** | **4.9× recovery; still loses to cuBLAS (tensor cores)** |
+| Reference: vanilla HF at B=16 | 335.8 | 1.00× | cuBLAS fp16 GEMM with tensor cores |
+| Reference: 4c at B=1 (kernel design point) | 56.9 | 1.16× vs vanilla B=1 | M=1 kernel — unaffected by this change |
+
+The new kernel is **correct** (max abs err 0.25, mean rel err ~0.001 —
+the same fp16 reduction-order noise floor as 3c) and **amortizes weight
+bandwidth as designed**: from M=2 through M=16, per-call time is
+near-flat at ~200 µs/call (the work is BLOCK_M-sized regardless of
+actual M ≤ BLOCK_M). The 4c memory savings (51% peak VRAM) and accuracy
+metrics are unchanged — only the latency moved.
+
+### Why we don't beat cuBLAS at M=16
+
+Without tensor cores, scalar fp32 FMA throughput can't keep up. At M=16,
+K=4096, N=14336 (MLP up):
+
+- **cuBLAS fp16:** reads 112 MB of fp16 weights, time 138 µs ≈ **812 GB/s**
+  — 80% of peak HBM, *bandwidth-bound on fp16 weights via tensor cores*.
+- **Our kernel:** reads 28 MB of int4 weights (4× less!), time 239 µs ≈
+  **117 GB/s** — well below HBM peak. *Compute-bound on scalar fp32 FMA*.
+
+So our int4 weight savings *should* make us win on bandwidth, and they
+would — except the scalar fp32 accumulate path can't process the streamed
+int4 weights fast enough to keep the HBM channel saturated. On RTX 4090
+(sm_89): fp32 scalar peak ≈ 82 TFLOPs vs fp16 MMA peak ≈ 165 TFLOPs.
+Tensor cores are the missing piece.
+
+### What's still open
+
+- **Phase 6 — tensor-core W4A16.** Rewrite the batched-decode kernel with
+  `mma.sync` (PTX MMA instruction, 16×8×16 shape on sm_89). This is what
+  Marlin / AWQ-V2 / GPTQMarlin all do — and the only path to closing the
+  remaining 1.7× gap to cuBLAS at M=16. The Phase 5 kernel makes a
+  reasonable scaffold for it: same threading model, same K-split, same
+  shmem layout, just swap the inner scalar FMA loop for MMA.
 - **`ncu` profile + roofline plot** for the Phase 4 decode step on the
   patched model. Pending GPU clock lock + a quiet system.
 - **Calibration-aware quant (GPTQ / AWQ)** to recover the W4A16 accuracy
-  hit. Out of Phase 4 / 5 scope; flagged for any future "production
-  quality" pass.
+  hit. Out of scope; flagged for any future "production quality" pass.
 - **vLLM integration.** Phase 4 lives entirely on HF transformers; the
   same patches would not drop into vLLM cleanly because vLLM has its
   own PagedAttention + worker model. A vLLM port is a separate effort.
+
+### Phase 5 lesson
+
+**An M-aware kernel without tensor cores is necessary but not sufficient
+for batched-decode W4A16 wins.** Phase 5 proves the BLOCK_M amortization
+works structurally — the per-block time scales BLOCK_M-rows-of-work, not
+M-rows-of-work — but the residual cuBLAS gap is a scalar-vs-tensor-core
+question, not a memory-pattern question. The fix is well-known (MMA),
+just out of this phase's scope.
 
 ## Reference workload reproduction
 

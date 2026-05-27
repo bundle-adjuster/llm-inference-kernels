@@ -144,36 +144,49 @@ section; per-config JSON outputs in `docs/results/{lm_eval,e2e_eval}/`.
 
 ---
 
-## Phase 5 — Batched-decode W4A16 kernel
+## Phase 5 — Batched-decode W4A16 kernel  *(partial: recovery yes, full win no)*
 
-Resolves the Phase 4c regression. The Phase 3 `w4a16_gemm_decode_kernel`
-assumes M=1; the locked workload runs at M=batch=16, falls back to the
-naive M>1 kernel which re-reads weights per output row (4× the bandwidth
-of fp16 cuBLAS).
+Resolves the Phase 4c regression at batch=16. Same K-split-across-warps
+pattern as Phase 3c, but each thread accumulates a `BLOCK_M=16`-length
+vector of fp32 partials; each warp has its own `[BLOCK_M, group_size]`
+activation tile in shmem so the int4 weight stream is amortized across
+all M rows.
 
-- [ ] Design + implement an M-aware W4A16 kernel:
-  - BLOCK_M × BLOCK_N output tile (BLOCK_M ∈ {8, 16}; sweep)
-  - Weights for the [BLOCK_K, BLOCK_N] tile loaded **once** into shared
-    memory and reused across BLOCK_M output rows (amortize int4 unpack
-    + weight bandwidth across M)
-  - Tensor-core MMA path (`mma.sync.aligned`) if the perf delta justifies
-    the code complexity; fall back to per-thread accumulators if not
-- [ ] `tests/test_quant.py`: extend coverage to M ∈ {1, 8, 16, 32} at
-  Llama 3 8B shapes; correctness vs the existing reference
-- [ ] Wire into `llmik_cuda.w4a16_gemm` dispatch so it routes the new
-  kernel at M ∈ [1, ~64] and falls back to the naive at larger M (or
-  the dequant-then-cuBLAS path at very large M)
-- [ ] Benchmark vs fp16 cuBLAS at M ∈ {1, 8, 16, 32} on all three layer
-  shapes (attn QKV/O, MLP up/gate, MLP down)
-- [ ] Re-run Phase 4c (`scripts/run_phase4_eval.py --step 4c`) at the
-  locked batch=16 workload; new tok/s lands in `docs/results/e2e_eval/`
-- [ ] Update `docs/04-end-to-end-integration-journey.md` "What's still
-  open" with the resolution and the new 4c numbers
-- [ ] Update RESULTS.md Phase 4 row + README headline table
+- [x] `w4a16_gemm_batched_decode_kernel` in `kernels/quant/quant_matmul.cu`
+- [x] Launcher dispatch: M==1 → Phase 3c; M∈[2,16] → Phase 5; M>16 → Phase 3b naive
+- [x] Correctness vs reference at M ∈ {1, 2, 4, 8, 16}: max abs err 0.25,
+  mean rel err ~0.001 (same fp16 reduction noise floor as Phase 3c)
+- [x] Benchmark vs cuBLAS at M ∈ {1, 4, 8, 16, 32} on all three shapes:
+  M=2..16 is near-flat ~200 µs (amortization works structurally), but
+  remains ~1.7× behind cuBLAS at M=16 because cuBLAS uses tensor cores
+- [x] Re-run Phase 4c at locked batch=16: **40.9 → 199.9 tok/s (4.9×
+  recovery; 0.60× vs vanilla HF)**. Memory savings (51% peak VRAM) and
+  all accuracy numbers unchanged.
+- [x] Update `docs/04-end-to-end-integration-journey.md` (Phase 5
+  addendum), RESULTS.md Phase 4c row + Phase 5 update, README headline.
 
-**Exit criterion:** Phase 4c at batch=16 beats vanilla fp16 cuBLAS on
-tok/s while preserving the 51% peak VRAM win and the existing accuracy
-numbers.
+**Exit criterion (partial):** the regression is largely recovered (0.12×
+→ 0.60× vs vanilla); a full win at batch=16 requires tensor cores —
+Phase 6.
+
+---
+
+## Phase 6 — Tensor-core W4A16 (`mma.sync`)
+
+Close the remaining ~1.7× gap to cuBLAS at M=16. Rewrite the Phase 5
+batched-decode kernel's inner loop to use `mma.sync.aligned` (PTX MMA,
+fp16 inputs with fp32 or fp16 accumulator, 16×8×16 shape on sm_89). Keep
+Phase 5's threading model (4 warps, K-split-across-warps, BLOCK_M=16,
+BLOCK_N=32) — only the inner accumulate-and-FMA path swaps.
+
+- [ ] `ldmatrix.sync` for loading the dequantized weight tile into the
+  MMA-required register layout
+- [ ] `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` for the FMA
+- [ ] Verify correctness vs the existing reference
+- [ ] Benchmark and re-run Phase 4c
+
+**Exit criterion:** Phase 4c at batch=16 beats vanilla fp16 cuBLAS while
+preserving the 51% peak VRAM win and accuracy.
 
 ---
 
