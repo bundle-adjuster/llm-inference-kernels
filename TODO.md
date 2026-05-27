@@ -114,53 +114,66 @@ decode shapes — landed at 2.88×–6.97×).
 
 ---
 
-## Phase 4 — End-to-end integration & presentation
+## Phase 4 — End-to-end integration  *(complete; full narrative in `docs/04-end-to-end-integration-journey.md`)*
 
-Approach: monkeypatch HF Llama 3.1 8B Instruct one kernel at a time, on its
-own branch, with full eval per step (the GPTQ/AWQ/KIVI paper bar — MMLU 5-shot,
-HellaSwag 0-shot, ARC-Challenge 25-shot, plus WikiText-2 PPL, greedy-token
-match rate, decode tokens/sec, peak VRAM). Each integration step gets its own
-RESULTS.md row so the accuracy/latency/memory tradeoff is attributable.
+All four sub-phases merged to `main`. Headline numbers in
+[`docs/results/RESULTS.md`](docs/results/RESULTS.md) "End-to-end (Phase 4)"
+section; per-config JSON outputs in `docs/results/{lm_eval,e2e_eval}/`.
 
-### 4-prep. Eval infrastructure (branch `phase4-eval-prep`)
-- [ ] Install `lm-evaluation-harness`; smoke-test on Llama 3.1 8B Instruct
-- [ ] `scripts/run_lm_eval.py`: wrapper for MMLU/HellaSwag/ARC-C
-- [ ] `scripts/run_e2e_eval.py`: WikiText-2 PPL + greedy-token-match + tokens/sec + peak VRAM
-- [ ] Run vanilla Llama 3.1 8B Instruct baseline; lock numbers in `docs/results/lm_eval/vanilla.json` and `docs/results/e2e_eval/vanilla.json`; first Phase 4 row in RESULTS.md
-- [ ] Save vanilla greedy-reference token outputs (used by 4a–4c match rate)
-- [ ] Merge `phase4-eval-prep` → `main`
+- [x] **4-prep** (`phase4-eval-prep`, commit `1c56d82`): eval scaffolding
+  (`scripts/run_lm_eval.py` + `scripts/run_e2e_eval.py`) + vanilla baseline
+  numbers locked. Llama 3.1 8B Instruct: MMLU 68.32%, HellaSwag 79.51%,
+  ARC-C 60.84%, PPL 7.055, 335.8 tok/s, 18.50 GB peak VRAM.
+- [x] **4a** (`phase4-attention`, commit `d6d8c88`): F.sdpa rebind →
+  Phase 1 v3 decode_attention for q_len==1; un-expands `repeat_kv`. **Bit-
+  identical accuracy** + 1.025× tok/s.
+- [x] **4b** (`phase4-kv-int4`, commit `0836a77`): Int4KIVICache + INT4
+  decode forward replacement + KIVI F.sdpa rebind for lm-eval. **1.55×
+  tok/s** for −1.03 pp MMLU + Δppl +0.20 (matches Phase 2c kernel-level).
+- [x] **4c** (`phase4-w4a16`, commit `8882880`): W4A16 patched Linears
+  (224 in-place replacements). **−51% peak VRAM** (18.50 → 9.05 GB) +
+  1.16× tok/s at batch=1; regression at batch=16 because the Phase 3
+  kernel is M=1-only → Phase 5.
+- [x] **4d** (`phase4-wrapup`): journey doc, README headline numbers,
+  TODO update.
 
-### 4a. Attention kernel integration (branch `phase4-attention`)
-- [ ] Monkeypatch `F.scaled_dot_product_attention` (same hook as `eval_perplexity.py`): dispatch our Phase 1 v3 `decode_attention` for `q_len == 1` (decode), fall back to the original SDPA for prefill
-- [ ] Greedy-match on 10 fixed prompts vs vanilla reference (catch integration bugs)
-- [ ] Full eval suite — lm-eval + e2e
-- [ ] RESULTS.md row + journey doc section
-- [ ] Merge → `main`
+**What's still open** (deferred, see journey doc "What's still open"):
+- `ncu` profile + roofline plot for the patched decode step
+- Calibration-aware quant (GPTQ / AWQ) to recover the W4A16 accuracy hit
+- vLLM port of the patches
 
-### 4b. KV-cache compression integration (branch `phase4-kv-int4`)
-- [ ] Replace HF `DynamicCache` with an INT4 KIVI cache: per-channel groupwise K (group=32), per-token V, packed 4-bit
-- [ ] On append: quantize current-token K/V via our Phase 2 kernels
-- [ ] On read: dispatch our Phase 2 INT4 KIVI attention kernel for decode
-- [ ] Full eval suite — Δppl, Δ MMLU/HellaSwag/ARC-C, tokens/sec, peak VRAM
-- [ ] RESULTS.md row + journey doc section
-- [ ] Merge → `main`
+---
 
-### 4c. W4A16 weight integration (branch `phase4-w4a16`)
-- [ ] Offline weight quantization script (`scripts/quantize_llama_weights.py`): symmetric INT4, group=128 along K, save packed + scales for each `q_proj`, `k_proj`, `v_proj`, `o_proj`, `up_proj`, `gate_proj`, `down_proj`
-- [ ] Patched linear layers using our Phase 3 `w4a16_gemm` for decode (M=1); fp16 fallback for prefill
-- [ ] Full eval suite — Δ accuracy on all metrics, tokens/sec, peak VRAM (~10 GB savings expected)
-- [ ] RESULTS.md row + journey doc section
-- [ ] Merge → `main`
+## Phase 5 — Batched-decode W4A16 kernel
 
-### 4d. Final headline + presentation (branch `phase4-wrapup` or directly on `main`)
-- [ ] `docs/04-end-to-end-integration-journey.md` — full Phase 4 narrative
-- [ ] Roofline plot + `ncu`/`nsys` summary figures
-- [ ] Fill README results table with final headline numbers
-- [ ] Distill RESULTS.md into a slide-ready interview summary
+Resolves the Phase 4c regression. The Phase 3 `w4a16_gemm_decode_kernel`
+assumes M=1; the locked workload runs at M=batch=16, falls back to the
+naive M>1 kernel which re-reads weights per output row (4× the bandwidth
+of fp16 cuBLAS).
 
-**Exit criterion:** End-to-end *Target* met or a profiler-backed account of
-why; accuracy tradeoff documented across all four eval metrics for each
-kernel.
+- [ ] Design + implement an M-aware W4A16 kernel:
+  - BLOCK_M × BLOCK_N output tile (BLOCK_M ∈ {8, 16}; sweep)
+  - Weights for the [BLOCK_K, BLOCK_N] tile loaded **once** into shared
+    memory and reused across BLOCK_M output rows (amortize int4 unpack
+    + weight bandwidth across M)
+  - Tensor-core MMA path (`mma.sync.aligned`) if the perf delta justifies
+    the code complexity; fall back to per-thread accumulators if not
+- [ ] `tests/test_quant.py`: extend coverage to M ∈ {1, 8, 16, 32} at
+  Llama 3 8B shapes; correctness vs the existing reference
+- [ ] Wire into `llmik_cuda.w4a16_gemm` dispatch so it routes the new
+  kernel at M ∈ [1, ~64] and falls back to the naive at larger M (or
+  the dequant-then-cuBLAS path at very large M)
+- [ ] Benchmark vs fp16 cuBLAS at M ∈ {1, 8, 16, 32} on all three layer
+  shapes (attn QKV/O, MLP up/gate, MLP down)
+- [ ] Re-run Phase 4c (`scripts/run_phase4_eval.py --step 4c`) at the
+  locked batch=16 workload; new tok/s lands in `docs/results/e2e_eval/`
+- [ ] Update `docs/04-end-to-end-integration-journey.md` "What's still
+  open" with the resolution and the new 4c numbers
+- [ ] Update RESULTS.md Phase 4 row + README headline table
+
+**Exit criterion:** Phase 4c at batch=16 beats vanilla fp16 cuBLAS on
+tok/s while preserving the 51% peak VRAM win and the existing accuracy
+numbers.
 
 ---
 

@@ -61,7 +61,9 @@ Phase 3 W4A16 GEMM findings are in
 | **Quantized matmul (W4A16)** — attn QKV/O (K=4096, N=4096, M=1) | fp16 W: 32 MiB | fp16 cuBLAS 0.047 ms | INT4 W: **8.25 MiB / 0.016 ms** | **0.26× memory** · **2.88× latency** | Phase 3c; symmetric INT4 per-channel groupwise (group=128) |
 | **Quantized matmul (W4A16)** — MLP up/gate (K=4096, N=14336, M=1) | fp16 W: 112 MiB | fp16 cuBLAS 0.134 ms | INT4 W: **28.88 MiB / 0.019 ms** | **0.26× memory** · **6.97× latency** | Phase 3c; the headline shape — 7× over cuBLAS |
 | Quantized matmul (W4A16) — MLP down (K=14336, N=4096, M=1) | fp16 W: 112 MiB | fp16 cuBLAS 0.133 ms | INT4 W: 28.88 MiB / **0.045 ms** | **0.26× memory** · **2.96× latency** | Phase 3c |
-| End-to-end (Llama 3 8B, kernels integrated) | _TBD_ | vanilla vLLM 703 tok/s | _TBD_ | _TBD_ | Phase 4 |
+| **E2E Phase 4a** — Llama 3.1 8B + fused attention | locked workload (batch=16, prompt=512, gen=512), greedy | vanilla HF 335.8 tok/s · 18.50 GB peak VRAM · MMLU 68.32% | **344.1 tok/s · 18.57 GB · MMLU 68.32%** | **+2.5% tok/s · bit-identical accuracy** | Phase 4a; attention bit-perfect (greedy_match=1.0). Small e2e gain because attention is ~4% of decode time at this workload |
+| **E2E Phase 4b** — + INT4 KIVI KV cache | same | vanilla as above | **521.7 tok/s · 18.41 GB · MMLU 67.29%** | **1.55× tok/s · −1.03 pp MMLU · Δppl +0.20** | Phase 4b; PPL delta matches Phase 2c's kernel-level number to within rounding; real INT4 cache class via HF Cache subclass |
+| **E2E Phase 4c** — + W4A16 weights (memory headline) | same | vanilla as above | 40.9 tok/s (B=16) / **56.9 tok/s (B=1)** · **9.05 GB peak VRAM** · MMLU 62.40% | **−51% peak VRAM (-9.45 GB) · 1.16× tok/s at B=1** · −5.92 pp MMLU | Phase 4c; 4c surfaces an M-awareness gap — the Phase 3 W4A16 kernel was M=1-only and the locked workload runs at M=16. Memory + B=1 wins land; B=16 latency awaits the Phase 5 batched-decode W4A16 kernel |
 
 ## Repo layout
 
@@ -148,4 +150,19 @@ the docs/03 *Target* of 2–3× speedup. Full findings in
 [`docs/03-quantized-matmul-journey.md`](docs/03-quantized-matmul-journey.md).
 Marlin head-to-head and GPTQ perplexity validation deferred.
 
-**Phase 4 — end-to-end integration + decode tokens/sec: next.**
+**Phase 4 — end-to-end integration on Llama 3.1 8B Instruct: complete.**
+Three monkeypatches landed one-kernel-at-a-time, with full
+MMLU/HellaSwag/ARC-C + WikiText-2 PPL + tokens/sec + peak VRAM at each
+step. Headlines on the locked workload (batch=16, prompt=512, gen=512):
+**4a** fused attention is bit-identical to vanilla on every accuracy
+metric and +2.5% tok/s; **4b** INT4 KIVI KV cache hits 1.55× tok/s for
+-1.03 pp MMLU + Δppl +0.20 (matches Phase 2c kernel-level prediction);
+**4c** W4A16 weights cut peak VRAM 51% (18.50 → 9.05 GB) and give
+1.16× tok/s at batch=1, but regress to 0.12× at batch=16 because the
+Phase 3 kernel is M=1-only and the locked workload has M=16 — the
+batched-decode kernel is Phase 5. Full narrative in
+[`docs/04-end-to-end-integration-journey.md`](docs/04-end-to-end-integration-journey.md).
+
+**Phase 5 — batched-decode W4A16 kernel: next.** Build an M-aware
+W4A16 GEMM (Marlin-style: BLOCK_M × BLOCK_N output tile, weights loaded
+once and amortized across M) so 4c at batch=16 also wins.
