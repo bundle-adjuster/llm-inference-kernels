@@ -9,6 +9,12 @@ Cross-references:
   [`01-fused-attention-journey.md`](01-fused-attention-journey.md).
 - The narrative for Phase 2 (2a → 2d) lives in
   [`02-kv-cache-compression-journey.md`](02-kv-cache-compression-journey.md).
+- The narrative for Phase 3 (3a → 3c) lives in
+  [`03-quantized-matmul-journey.md`](03-quantized-matmul-journey.md).
+- The narrative for Phase 4 (e2e integration), Phase 5 (batched-decode
+  W4A16) and Phase 6 (tensor-core W4A16) lives in
+  [`04-end-to-end-integration-journey.md`](04-end-to-end-integration-journey.md)
+  — including the Phase 5/6 addenda.
 - Per-step quantitative table: [`results/RESULTS.md`](results/RESULTS.md).
 - Reference workload definition (locked): [`benchmarking-methodology.md`](benchmarking-methodology.md).
 
@@ -54,7 +60,8 @@ python benchmarks/bench_attention.py
 ```
 
 If both work, the extension is built correctly and `main` is in the
-v3 + INT4 KIVI state.
+v3 + INT4 KIVI + W4A16 + Phase 6 tensor-core state (every kernel landed
+through Phase 6 is on the dispatch path).
 
 ---
 
@@ -364,7 +371,264 @@ small N) that affect the three shapes differently.
 
 ---
 
-## 5. Common gotchas
+## 5. Phase 4 — End-to-end integration (branches `phase4-eval-prep` → `phase4-wrapup`)
+
+Phase 4 takes the kernels from Phases 1–3 and plugs them into the actual
+Llama 3.1 8B Instruct model via HF monkeypatch, one kernel at a time,
+with a full accuracy/latency/memory eval at each step. **This is where
+the kernel-level wins meet the real workload and the tradeoffs become
+visible.**
+
+Each sub-step has its own branch; `main` carries all of them merged.
+
+```bash
+git checkout phase4-<step>
+python setup.py build_ext --inplace
+```
+
+### What to expect, per sub-step
+
+Reference workload: Llama 3.1 8B Instruct, batch=16, prompt=512, gen=512.
+Baseline (vanilla HF): MMLU 68.32%, HellaSwag 79.51%, ARC-C 60.84%,
+PPL 7.055, 335.8 tok/s, 18.50 GB peak VRAM.
+
+| Branch                | Commit    | tok/s  | Peak VRAM | MMLU    | PPL   | What's new                                         |
+|-----------------------|-----------|-------:|----------:|--------:|------:|----------------------------------------------------|
+| `phase4-eval-prep`    | `1c56d82` | 335.8  | 18.50 GB  | 68.32%  | 7.055 | Eval scaffolding + vanilla baseline locked         |
+| `phase4-attention`    | `d6d8c88` | 344.1  | 18.57 GB  | 68.32%  | 7.055 | F.sdpa rebind → Phase 1 v3 decode_attention        |
+| `phase4-kv-int4`      | `0836a77` | **521.7** | 18.41 GB  | 67.29% | 7.256 | Int4KIVICache (HF Cache subclass) + INT4 attention |
+| `phase4-w4a16` (M=1 only) | `8882880` | 40.9  | **9.05 GB** | 62.40% | 8.087 | QuantizedLinear (W4A16 weights) — regressed at B=16 |
+| `phase4-wrapup`       | `7da3de4` | (docs) | —         | —       | —     | Journey doc + README headlines + Phase 5/6 stubs   |
+
+The 4c row above shows the *historical* number on the `phase4-w4a16`
+branch — it falls back to the v0 naive kernel at M=batch=16, which
+re-reads weights 16× per output row. Phase 5 + Phase 6 fix that;
+re-running 4c with the current `main` gives 198.7 tok/s.
+
+### What to run
+
+```bash
+# Run a single phase 4 step end-to-end (loads model once, applies the
+# step's patches, runs e2e + lm-eval). Each step ~30-60 min.
+python scripts/run_phase4_eval.py --step vanilla   # baseline (3 min for e2e, ~40 min for lm-eval)
+python scripts/run_phase4_eval.py --step 4a        # bit-identical accuracy + tok/s
+python scripts/run_phase4_eval.py --step 4b        # INT4 KIVI KV cache: ~1pp MMLU, 1.55x tok/s
+python scripts/run_phase4_eval.py --step 4c        # W4A16: -51% peak VRAM, -5.9pp MMLU
+
+# Smoke test a step (PPL + greedy match only — ~3 min)
+python scripts/run_phase4_eval.py --step 4b --skip-lm-eval --skip-tokens-per-sec
+```
+
+Outputs go to `docs/results/{lm_eval,e2e_eval}/<step_name>.json`. The
+vanilla greedy reference (10 prompts × 64 new tokens) lives at
+`docs/results/e2e_eval/vanilla_reference_outputs.json`; 4a/4b/4c
+compare against it for the greedy-match metric.
+
+### What to look for, per sub-step
+
+**`phase4-eval-prep`** — read `scripts/run_lm_eval.py` +
+`scripts/run_e2e_eval.py`. The interesting design choice is that both
+accept a *pre-loaded* HF model (not just a `pretrained=<id>` string),
+so the 4a/4b/4c orchestrator can pass a patched model in. lm-eval
+defaults to creating its own; you have to use
+`HFLM(pretrained=model, tokenizer=tokenizer, batch_size="auto")` to
+inject yours.
+
+**`phase4-attention`** — F.sdpa rebind in `integration/attention_patch.py`.
+The interesting design choices:
+- `q_len == 1` (decode) dispatches to our kernel; `q_len > 1` (prefill)
+  falls through to original SDPA.
+- HF's `repeat_kv` is undone via `K[:, ::n_rep].contiguous()` — without
+  this, our kernel reads 4× the KV bandwidth on Llama 3 8B and loses
+  its whole reason for existing.
+- Accuracy is **bit-identical** to vanilla on every prefill-based metric
+  + `greedy_match=1.0` confirms decode is bit-perfect across 640 tokens.
+
+The +2.5% tok/s is the *interesting* result: attention is only ~4% of
+decode time at this workload (batch=16, avg kv_len≈768). The microbench
+saw 1.91× faster, but Amdahl says the e2e win is the kernel-speedup ×
+fraction-of-time-on-that-kernel.
+
+**`phase4-kv-int4`** — read `integration/kv_int4_cache.py` (the HF Cache
+subclass) + the `patched_int4_decode_attention` context in
+`integration/attention_patch.py`. The design choices:
+- The cache stores packed INT4 + scales; an fp16 *residual buffer* holds
+  recent tokens that don't yet fill a `group_size=32` group. Decode
+  appends 1 token at a time; once the residual hits 32, that chunk is
+  quantized into the packed storage.
+- Two return paths from `update()`: `update()` returns dequantized fp16
+  for SDPA compat (used at prefill); `append_only()` skips the fp16
+  materialize and is used by the int4 decode fast path.
+- Decode replaces `LlamaSdpaAttention.forward` to call our
+  `decode_attention_int4` directly on the packed tensors. lm-eval
+  prefill uses a separate F.sdpa rebind that quantize-and-dequantizes —
+  same KIVI math, same noise.
+
+**The PPL delta of +0.20 matches Phase 2c's kernel-level +0.196** —
+direct validation that the integration faithfully reproduces the
+kernel's noise pattern. The 1.55× tok/s is bigger than Phase 2c's 1.29×
+microbench because the forward replacement *also* skips `repeat_kv` and
+SDPA dispatch overhead.
+
+**`phase4-w4a16`** — read `integration/w4a16_patch.py`. The
+`QuantizedLinear` class replaces 224 `nn.Linear` modules in place
+(7 per layer × 32 layers). Weight VRAM drops from 16.06 GB to 5.70 GB
+immediately after the patch.
+
+The interesting result: at the locked workload (batch=16), 4c
+*regressed* on tok/s. The Phase 3 W4A16 kernel was designed for M=1
+(single-stream decode); at M=batch=16, the launcher falls back to v0
+naive, which re-reads weights 16× per output row. **This is exactly the
+lesson Phase 3 had flagged**: "batched-decode M>1 is integration
+concern (Phase 4)" — 4c is where it surfaces.
+
+Phase 5 and Phase 6 (next two sections) close most of that gap; the
+4c row in RESULTS.md reflects the *current* (Phase 6) dispatch.
+
+---
+
+## 6. Phase 5 — Batched-decode W4A16 kernel (branch `phase5-batched-w4a16`)
+
+Resolves the Phase 4c regression at batch=16 by adding
+`w4a16_gemm_batched_decode_kernel`. Same K-split-across-warps pattern
+as the Phase 3c decode kernel, but each thread accumulates a length-
+`BLOCK_M=16` vector of fp32 partials, and each warp has its own
+`[BLOCK_M, group_size]` activation tile in shmem so the int4 weight
+stream is amortized across all M rows.
+
+The launcher dispatch becomes:
+
+```
+M == 1            → v1 decode (Phase 3c)
+M in [2, 16]      → v2 batched-decode (Phase 5)
+M  > 16           → v0 naive (Phase 3b)
+```
+
+```bash
+git checkout phase5-batched-w4a16
+python setup.py build_ext --inplace
+
+# Microbench at the three Llama 3 8B shapes, M-sweep:
+python benchmarks/bench_w4a16.py
+
+# Re-run Phase 4c end-to-end with the new kernel:
+python scripts/run_phase4_eval.py --step 4c --skip-lm-eval
+```
+
+### What to expect
+
+| Phase 4c at batch=16                | tok/s     | Notes                                          |
+|-------------------------------------|----------:|------------------------------------------------|
+| M=1 kernel only (`phase4-w4a16`)    | 40.9      | naive M>1 fallback — 16× weight bandwidth      |
+| + Phase 5 batched-decode kernel     | **199.9** | **4.9× recovery; 0.60× vs vanilla HF (335.8)** |
+
+Kernel-level at M ∈ [2, 16]: near-flat ~200 µs/call across all shapes
+(the work is BLOCK_M-sized regardless of actual M ≤ BLOCK_M — exactly
+the amortization we wanted). Still ~1.7× behind cuBLAS at M=16 because
+cuBLAS uses tensor cores; ours used scalar fp32 FMA. Closing that is
+Phase 6.
+
+### What to look for
+
+Read `kernels/quant/quant_matmul.cu::w4a16_gemm_batched_decode_kernel`.
+Two interesting differences vs Phase 3c v1:
+
+1. **Per-warp activation tile in shmem.** v1 cached the *full* K-wide
+   activation in one shared `act_smem[K]`; that worked because M=1 so
+   the tile was small. v2 has BLOCK_M=16 rows, which would be 16×
+   bigger — too big for shared memory at Llama 3 K=14336. The fix:
+   each warp gets its own slice of K, so the per-warp tile only spans
+   one K group (BLOCK_M × group_size = 16 × 128 fp16 = 4 KB per warp,
+   16 KB across 4 warps).
+2. **Per-thread vector accumulator.** Each thread holds 16 fp32
+   accumulators (one per M row of its column). The inner FMA loop
+   reads one act value (broadcast across the warp) and multiplies it
+   against the column's weight nibble — 16 FMAs per nibble per thread.
+
+The lesson: the M-amortization works structurally (kernel time is flat
+across M ∈ [2, 16]), but **scalar fp32 FMA throughput can't keep up
+with the int4 weight bandwidth** at this M. Per-Linear time is
+~200 µs, compute-bound, while cuBLAS is ~140 µs at the same shape,
+*bandwidth-bound on fp16 weights*. We read 4× fewer bytes than cuBLAS
+but can't process them fast enough. Tensor cores are what closes that.
+
+---
+
+## 7. Phase 6 — Tensor-core W4A16 kernel (branch `phase6-tensorcore-w4a16`)
+
+Drops `mma.sync` (via the wmma C++ API, `m16n16k16` fp16→fp32) into the
+Phase 5 batched-decode kernel's inner accumulate loop. Same M=16
+batched-decode shape, same threading model, same dequant path — only
+the FMA path swaps.
+
+The launcher dispatch becomes:
+
+```
+M == 1            → v1 decode (Phase 3c)
+M in [2, 16]      → v3 tensor-core (Phase 6)   -- v2 kept in file as reference
+M  > 16           → v0 naive (Phase 3b)
+```
+
+```bash
+git checkout phase6-tensorcore-w4a16
+python setup.py build_ext --inplace
+
+# Microbench
+python benchmarks/bench_w4a16.py
+
+# Re-run Phase 4c
+python scripts/run_phase4_eval.py --step 4c --skip-lm-eval
+```
+
+### What to expect
+
+**Kernel-level vs Phase 5 v2 at M=16** (Llama 3 8B shapes):
+
+| Shape (K, N)             | v2 scalar | v3 tensor-core | improvement |
+|--------------------------|----------:|---------------:|------------:|
+| 4096 × 4096 (QKV/O)      | 211 µs    | **152 µs**     | **1.39×**   |
+| 4096 × 14336 (MLP up/gate)| 239 µs   | **167 µs**     | **1.43×**   |
+| 14336 × 4096 (MLP down)  | 686 µs    | **514 µs**     | **1.33×**   |
+
+vs cuBLAS at M=16: 0.37× / 0.81× / 0.35× respectively. Closer than v2
+on every shape; closest to parity on the MLP up/gate (the headline
+shape for decode throughput).
+
+**E2E Phase 4c at batch=16**: 198.7 tok/s — *essentially unchanged*
+from Phase 5's 199.9. **The microbench win doesn't show up end-to-end.**
+
+### What to look for
+
+Read `kernels/quant/quant_matmul.cu::w4a16_gemm_tc_kernel`. Compared
+to Phase 5 v2:
+
+- `BLOCK_N` widens from 32 (one warp's lanes) to 64 (4 warps × 16
+  cols/warp). No K-split-across-warps — each warp processes the full
+  K independently across its own col tile.
+- The inner accumulate loop iterates `group_size / WMMA_K = 128 / 16
+  = 8` MMA calls per K group, consuming the dequantized weight tile
+  via `load_matrix_sync(b_frag, ...)`.
+- Output is staged through shmem because rows `[M, 16)` are
+  zero-padded; the cooperative write skips them.
+
+**Why the e2e didn't move:** a back-to-back microbench of 7 same-shape
+calls shows 173 µs/call vs 153 µs single-call — only 13% inter-call
+overhead, so launch saturation isn't the cause. The likely bottleneck
+is **host-side Python/PyTorch dispatch overhead per Linear call**:
+~5-30 µs × 224 Linears × 512 decode steps ≈ 5-30 s of host work
+across a ~41 s run. At Phase 5's kernel time the GPU was the
+bottleneck; at Phase 6's the host is. The kernel speedup is real but
+masked by host overhead.
+
+**The lesson:** a microbench win can be invisible end-to-end if a
+*different* bottleneck moves into the gap. Closing the e2e gap now
+needs host-side optimization (CUDA graphs / `torch.compile` to capture
+one decode step as a single GPU command), not more kernel work. That's
+queued as Phase 7 in TODO.md.
+
+---
+
+## 8. Common gotchas
 
 **After `git checkout <branch>`, always rebuild**:
 ```bash
@@ -400,25 +664,40 @@ will need touching.
 
 ---
 
-## 6. Where to go from here
+## 9. Where to go from here
 
 - The **journey docs** are where the *why* lives. Each step's
   measurement is in RESULTS.md; the diagnosis is in the journey doc.
   - Phase 1: [`01-fused-attention-journey.md`](01-fused-attention-journey.md)
   - Phase 2: [`02-kv-cache-compression-journey.md`](02-kv-cache-compression-journey.md)
+  - Phase 3: [`03-quantized-matmul-journey.md`](03-quantized-matmul-journey.md)
+  - Phase 4 (+ Phase 5/6 addenda): [`04-end-to-end-integration-journey.md`](04-end-to-end-integration-journey.md)
 - The **design docs** are forward-looking specs.
   - Phase 1 (decode attention): [`01-fused-attention.md`](01-fused-attention.md)
   - Phase 2 (KV compression): [`02-kv-cache-compression.md`](02-kv-cache-compression.md)
-  - Phase 3 (W4A16 GEMM): [`03-quantized-matmul.md`](03-quantized-matmul.md) — not started
+  - Phase 3 (W4A16 GEMM): [`03-quantized-matmul.md`](03-quantized-matmul.md)
 - The **TODO list** is the work tracker.
-  - [`../TODO.md`](../TODO.md)
+  - [`../TODO.md`](../TODO.md) — Phase 7 (CUDA graphs to hide host
+    overhead) is the next queued item.
 - The **benchmarking methodology** locks the reference workload.
   - [`benchmarking-methodology.md`](benchmarking-methodology.md)
 
 **If you only have 10 minutes**:
-1. Read the Phase 1 journey doc § "Summary" + "Lessons we want to
-   carry forward" — that's the high-density payload.
-2. Same for Phase 2 journey doc.
-3. `git checkout v3 && pytest tests/test_attention.py` — see the
-   correctness gate.
-4. `python benchmarks/bench_attention.py` — see the headline number.
+1. Read the Phase 4 journey doc § "Summary" + "Lessons we want to
+   carry forward" — the highest-density view of where every kernel
+   actually ends up on the real model.
+2. `git checkout main && pytest tests/` — see the correctness gate
+   across every kernel landed.
+3. `python benchmarks/bench_attention.py` and
+   `python benchmarks/bench_w4a16.py` — the headline kernel-level numbers.
+
+**If you have an afternoon**:
+1. Read the Phase 1 journey doc — the diagnostic-framework lessons
+   (dependency-chain-bound vs bandwidth-bound; v1/v4/v5 each illustrate
+   one) carry into Phase 2 and Phase 5.
+2. Read the Phase 4 journey doc, including the Phase 5 and Phase 6
+   addenda at the bottom — the "kernel-level win doesn't always land
+   end-to-end" story is unique to Phase 4-6 and is the most surprising
+   result in the project.
+3. `python scripts/run_phase4_eval.py --step 4b --skip-lm-eval` —
+   ~3 minutes; see the KIVI accuracy hit on real Llama 3.1 8B.
