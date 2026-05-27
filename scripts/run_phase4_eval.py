@@ -23,7 +23,6 @@ import argparse
 import os
 import sys
 import time
-from contextlib import ExitStack
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
@@ -32,31 +31,78 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from benchmarks.workload import MODEL_ID, N_KV_HEADS
-from integration.attention_patch import patched_decode_attention
+from benchmarks.workload import MODEL_ID, N_KV_HEADS, N_LAYERS
+from integration.attention_patch import (
+    patched_decode_attention,
+    patched_int4_decode_attention,
+    patched_kivi_int4_sdpa,
+)
+from integration.kv_int4_cache import Int4KIVICache
 from run_e2e_eval import run_e2e_eval                          # noqa: E402
 from run_lm_eval import run_eval as run_lm_eval, DEFAULT_TASKS  # noqa: E402
 
 STEP_TO_CONFIG_NAME = {
     "vanilla": "vanilla",
     "4a": "phase4a_attention",
-    "4b": "phase4b_kv_int4",   # 4b path -- patch wiring lands in Phase 4b
+    "4b": "phase4b_kv_int4",
     "4c": "phase4c_w4a16",     # 4c path -- patch wiring lands in Phase 4c
 }
 
+GROUP_SIZE = 32  # KIVI K group_size (Phase 2c convention)
 
-def _build_patch_stack(step: str, stack: ExitStack) -> None:
-    """Enter the context managers for the requested step (and prerequisites)
-    into the caller's ExitStack. Patches stack additively: 4b includes 4a, 4c
-    includes 4a+4b."""
-    if step in ("4a", "4b", "4c"):
-        stack.enter_context(patched_decode_attention(n_kv_heads=N_KV_HEADS))
-    if step in ("4b", "4c"):
-        raise NotImplementedError(
-            "4b (INT4 KIVI KV cache) patch not yet wired — coming in next step")
-    if step == "4c":
-        raise NotImplementedError(
-            "4c (W4A16) patch not yet wired — coming after 4b")
+
+def _run_step_4a(model, tokenizer, config_name, args):
+    """4a: single patch (F.sdpa rebind for decode_attention dispatch)."""
+    with patched_decode_attention(n_kv_heads=N_KV_HEADS):
+        if not args.skip_e2e:
+            run_e2e_eval(model=model, tokenizer=tokenizer,
+                         config_name=config_name,
+                         skip_tokens_per_sec=args.skip_tokens_per_sec)
+        if not args.skip_lm_eval:
+            run_lm_eval(model=model, tokenizer=tokenizer,
+                        config_name=config_name,
+                        tasks=DEFAULT_TASKS, limit=args.limit)
+
+
+def _run_step_4b(model, tokenizer, config_name, args):
+    """4b: two patch stacks — cache + forward replacement for e2e (generate uses
+    Int4KIVICache + decode_attention_int4); SDPA rebind for lm_eval (no cache,
+    KIVI noise injected at SDPA boundary). Both paths use the same KIVI math
+    so the noise pattern is consistent across all metrics."""
+    cache_factory = lambda: Int4KIVICache(
+        group_size=GROUP_SIZE, num_layers=N_LAYERS)
+
+    if not args.skip_e2e:
+        # PPL + greedy + tok/s. The Int4KIVICache.update() injects the KIVI
+        # noise during prefill; the LlamaSdpaAttention.forward replacement
+        # routes decode through decode_attention_int4.
+        with patched_int4_decode_attention(group_size=GROUP_SIZE):
+            run_e2e_eval(model=model, tokenizer=tokenizer,
+                         config_name=config_name,
+                         skip_tokens_per_sec=args.skip_tokens_per_sec,
+                         cache_factory=cache_factory)
+
+    if not args.skip_lm_eval:
+        # HFLM doesn't pass past_key_values, so injecting a cache there is
+        # awkward. The F.sdpa rebind quantize-dequantizes K/V on the fly,
+        # producing the same single-quantization-pass noise pattern as the
+        # cache path.
+        with patched_kivi_int4_sdpa(n_kv_heads=N_KV_HEADS, group_size=GROUP_SIZE):
+            run_lm_eval(model=model, tokenizer=tokenizer,
+                        config_name=config_name,
+                        tasks=DEFAULT_TASKS, limit=args.limit)
+
+
+def _run_step_vanilla(model, tokenizer, config_name, args):
+    """Baseline: no patches."""
+    if not args.skip_e2e:
+        run_e2e_eval(model=model, tokenizer=tokenizer,
+                     config_name=config_name,
+                     skip_tokens_per_sec=args.skip_tokens_per_sec)
+    if not args.skip_lm_eval:
+        run_lm_eval(model=model, tokenizer=tokenizer,
+                    config_name=config_name,
+                    tasks=DEFAULT_TASKS, limit=args.limit)
 
 
 def main() -> None:
@@ -91,26 +137,14 @@ def main() -> None:
     print(f"  loaded in {time.time() - t0:.1f}s; vram peak: "
           f"{torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
-    with ExitStack() as stack:
-        _build_patch_stack(args.step, stack)
-        print(f"  patches active: {args.step}")
-
-        if not args.skip_e2e:
-            run_e2e_eval(
-                model=model,
-                tokenizer=tokenizer,
-                config_name=config_name,
-                skip_tokens_per_sec=args.skip_tokens_per_sec,
-            )
-
-        if not args.skip_lm_eval:
-            run_lm_eval(
-                model=model,
-                tokenizer=tokenizer,
-                config_name=config_name,
-                tasks=DEFAULT_TASKS,
-                limit=args.limit,
-            )
+    if args.step == "vanilla":
+        _run_step_vanilla(model, tokenizer, config_name, args)
+    elif args.step == "4a":
+        _run_step_4a(model, tokenizer, config_name, args)
+    elif args.step == "4b":
+        _run_step_4b(model, tokenizer, config_name, args)
+    elif args.step == "4c":
+        raise NotImplementedError("4c (W4A16) — coming after 4b lands")
 
     print(f"\n== {config_name} eval complete ==")
 

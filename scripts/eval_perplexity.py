@@ -143,6 +143,7 @@ def evaluate_perplexity(
     model: torch.nn.Module,
     chunks: List[torch.Tensor],
     label: str,
+    cache_factory: Callable[[], "object"] | None = None,
 ) -> float:
     """Forward each chunk once, sum the cross-entropy loss, return perplexity.
 
@@ -151,6 +152,10 @@ def evaluate_perplexity(
         chunks: list of 1-D `[chunk_size]` int64 token tensors on CPU; each
             chunk is `.unsqueeze(0).cuda()`d into a `[1, chunk_size]` batch.
         label: printed alongside the result; should describe the patch state.
+        cache_factory: optional zero-arg callable returning a fresh HF Cache;
+            used by Phase 4b to inject Int4KIVICache so the forward exercises
+            the quantized cache path. If None, the model uses its default
+            (no cache for a single-chunk forward).
 
     Returns:
         Average perplexity across all chunks, weighted by token count.
@@ -161,8 +166,12 @@ def evaluate_perplexity(
     t0 = time.time()
     for chunk in chunks:
         input_ids = chunk.unsqueeze(0).cuda()
+        kwargs = {"labels": input_ids}
+        if cache_factory is not None:
+            kwargs["past_key_values"] = cache_factory()
+            kwargs["use_cache"] = True
         with torch.no_grad():
-            out = model(input_ids, labels=input_ids)
+            out = model(input_ids, **kwargs)
         n_tokens = input_ids.size(1) - 1
         total_loss += out.loss.item() * n_tokens
         total_tokens += n_tokens

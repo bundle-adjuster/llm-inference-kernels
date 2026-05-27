@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)                    # bare `eval_perplexity` import
@@ -78,23 +78,29 @@ def _load_wikitext_chunks(tokenizer, n_chunks: int, chunk_size: int) -> list[tor
     return [full_ids[i * chunk_size:(i + 1) * chunk_size] for i in range(n_chunks)]
 
 
-def _generate_greedy(model, tokenizer, prompt: str, max_new_tokens: int) -> list[int]:
+def _generate_greedy(model, tokenizer, prompt: str, max_new_tokens: int,
+                     *, cache_factory: Callable[[], "object"] | None = None) -> list[int]:
     """Greedy generate `max_new_tokens` tokens, return list[int] of new token ids."""
     ids = tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
     prompt_len = ids.size(1)
+    kwargs = dict(
+        input_ids=ids,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=max_new_tokens,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    if cache_factory is not None:
+        kwargs["past_key_values"] = cache_factory()
     with torch.inference_mode():
-        out = model.generate(
-            input_ids=ids,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        out = model.generate(**kwargs)
     return out[0, prompt_len:].tolist()
 
 
-def _measure_tokens_per_sec(model, tokenizer, runs: int = 3) -> tuple[float, float]:
+def _measure_tokens_per_sec(model, tokenizer, runs: int = 3,
+                            *, cache_factory: Callable[[], "object"] | None = None
+                            ) -> tuple[float, float]:
     """Decode tokens/sec + peak VRAM on the locked E2E workload (batch=16, prompt=512,
     gen=512). Returns (tokens_per_sec, peak_vram_gb)."""
     g = torch.Generator().manual_seed(0)
@@ -104,15 +110,18 @@ def _measure_tokens_per_sec(model, tokenizer, runs: int = 3) -> tuple[float, flo
     attn_mask = torch.ones_like(ids)
 
     def run() -> None:
+        kwargs = dict(
+            input_ids=ids, attention_mask=attn_mask,
+            max_new_tokens=E2E_GEN_LEN,
+            min_new_tokens=E2E_GEN_LEN,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        if cache_factory is not None:
+            kwargs["past_key_values"] = cache_factory()
         with torch.inference_mode():
-            model.generate(
-                input_ids=ids, attention_mask=attn_mask,
-                max_new_tokens=E2E_GEN_LEN,
-                min_new_tokens=E2E_GEN_LEN,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            model.generate(**kwargs)
 
     run()  # warmup
     torch.cuda.reset_peak_memory_stats()
@@ -131,10 +140,12 @@ def _measure_tokens_per_sec(model, tokenizer, runs: int = 3) -> tuple[float, flo
     return tokens_per_sec, peak_vram_gb
 
 
-def _measure_greedy_match(model, tokenizer, save_as_reference: bool) -> float:
+def _measure_greedy_match(model, tokenizer, save_as_reference: bool,
+                          *, cache_factory: Callable[[], "object"] | None = None) -> float:
     """Generate `GREEDY_MAX_NEW_TOKENS` tokens for each of `GREEDY_PROMPTS`, compare
     token-by-token against the saved reference. Returns match rate in [0, 1]."""
-    outputs = {p: _generate_greedy(model, tokenizer, p, GREEDY_MAX_NEW_TOKENS)
+    outputs = {p: _generate_greedy(model, tokenizer, p, GREEDY_MAX_NEW_TOKENS,
+                                   cache_factory=cache_factory)
                for p in GREEDY_PROMPTS}
 
     if save_as_reference or not REFERENCE_OUTPUTS.exists():
@@ -163,6 +174,7 @@ def run_e2e_eval(
     ppl_chunk_size: int = 2048,
     skip_tokens_per_sec: bool = False,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
+    cache_factory: Callable[[], "object"] | None = None,
 ) -> dict:
     """Run the three e2e measurements, write JSON, return results dict.
 
@@ -184,11 +196,14 @@ def run_e2e_eval(
     print(f"\n[{config_name}] WikiText-2 PPL ({n_ppl_chunks} chunks "
           f"x {ppl_chunk_size} tok) ...")
     chunks = _load_wikitext_chunks(tokenizer, n_ppl_chunks, ppl_chunk_size)
-    ppl = evaluate_perplexity(model, chunks, label=config_name)
+    ppl = evaluate_perplexity(model, chunks, label=config_name,
+                              cache_factory=cache_factory)
 
     print(f"\n[{config_name}] greedy-match on {len(GREEDY_PROMPTS)} prompts "
           f"({GREEDY_MAX_NEW_TOKENS} new tok each) ...")
-    greedy_match = _measure_greedy_match(model, tokenizer, save_as_reference=is_vanilla)
+    greedy_match = _measure_greedy_match(model, tokenizer,
+                                         save_as_reference=is_vanilla,
+                                         cache_factory=cache_factory)
     print(f"  greedy_match_rate = {greedy_match:.4f}")
 
     tokens_per_sec, peak_vram_gb = (0.0, 0.0)
@@ -196,7 +211,8 @@ def run_e2e_eval(
         print(f"\n[{config_name}] tokens/sec on locked E2E workload "
               f"(batch={E2E_BATCH}, prompt={E2E_PROMPT_LEN}, "
               f"gen={E2E_GEN_LEN}) ...")
-        tokens_per_sec, peak_vram_gb = _measure_tokens_per_sec(model, tokenizer)
+        tokens_per_sec, peak_vram_gb = _measure_tokens_per_sec(
+            model, tokenizer, cache_factory=cache_factory)
         print(f"  tokens_per_sec = {tokens_per_sec:.1f}")
         print(f"  peak_vram_gb   = {peak_vram_gb:.2f}")
 

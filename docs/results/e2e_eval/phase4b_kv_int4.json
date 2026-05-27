@@ -1,0 +1,10 @@
+{
+  "config_name": "phase4b_kv_int4",
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "ppl": 7.2556,
+  "greedy_match_rate": 0.5047,
+  "tokens_per_sec": 521.7,
+  "peak_vram_gb": 18.41,
+  "n_ppl_chunks": 64,
+  "ppl_chunk_size": 2048
+}
