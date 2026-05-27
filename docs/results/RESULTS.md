@@ -179,7 +179,7 @@ reference (10 prompts × 64 new tokens) is committed at
 | Config | Branch | Tokens/sec | vs HF | vs vLLM | Peak VRAM | PPL | greedy | MMLU | HellaSwag | ARC-C |
 |--------|--------|-----------|------:|--------:|----------:|----:|-------:|-----:|----------:|------:|
 | **vanilla HF** (Phase 4 baseline) | `phase4-eval-prep` | 335.8 | 1.00× | 0.48× | 18.50 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
-| + fused attention (4a) | `phase4-attention` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| + fused attention (4a) | `phase4-attention` | 344.1 | 1.025× | 0.49× | 18.57 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | + W4A16 weights (4c) | `phase4-w4a16` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | vanilla vLLM (ref) | _ | 703.2 | 2.09× | 1.00× | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -195,3 +195,27 @@ reference (10 prompts × 64 new tokens) is committed at
 - vanilla vLLM tokens/sec is the Phase 0 number; accuracy eval through
   vLLM is deferred (no clean HFLM hook), and is not strictly needed for
   the Phase 4 narrative — our kernels integrate into HF, not vLLM.
+
+**4a notes** (attention kernel integration):
+- Patch: rebind `F.scaled_dot_product_attention` so `q_len == 1` (decode)
+  dispatches to our Phase 1 v3 `decode_attention`; `q_len > 1` (prefill)
+  falls through to the original SDPA. Un-expands HF's `repeat_kv` via
+  `K[:, ::n_rep].contiguous()` so the kernel reads only `n_kv_heads = 8`
+  rows of KV, not the post-expand 32. Source: `integration/attention_patch.py`.
+- Accuracy is **bit-identical** to vanilla on every prefill-based metric
+  (PPL, MMLU, HellaSwag, ARC-C all match to the last reported digit) —
+  because prefill falls through to the original SDPA. `greedy_match_rate
+  = 1.0000` confirms decode is bit-perfect too: our kernel and SDPA produce
+  the same token under greedy sampling on all 10 × 64 = 640 generated
+  tokens. The kernel is a pure performance change, no accuracy tradeoff.
+- Tokens/sec gain is small (1.025×) because attention is only ~4% of decode
+  time at this workload — projection GEMMs dominate. At batch=16, avg
+  kv_len ≈ 768, head_dim=128, n_kv_heads=8, attention reads ~50 MB/layer
+  × 32 layers / ~1 TB/s ≈ 1.6 ms of the ~41 ms decode step. Doubling
+  attention speed saves ~0.8 ms / 41 ms ≈ 2%. The Phase 1 microbench's
+  1.91× was real but on a workload where attention was the *whole* thing
+  (no GEMMs around it). Big wins on this e2e workload come from 4c (W4A16
+  on projections), not 4a.
+- Peak VRAM up 0.07 GB = the un-expansion buffer (~66 MB). Negligible
+  vs total. Avoiding it would require subclassing `LlamaSdpaAttention`
+  to skip `repeat_kv` — deferred (not worth the code surface for 0.4%).
