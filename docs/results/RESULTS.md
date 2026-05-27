@@ -181,6 +181,7 @@ reference (10 prompts × 64 new tokens) is committed at
 | **vanilla HF** (Phase 4 baseline) | `phase4-eval-prep` | 335.8 | 1.00× | 0.48× | 18.50 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + fused attention (4a) | `phase4-attention` | 344.1 | 1.025× | 0.49× | 18.57 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | 521.7 | 1.55× | 0.74× | 18.41 GB | 7.256 | 0.5047 | 67.29% | 79.07% | 61.43% |
+| + W4A16 weights (4c) | `phase4-w4a16` | 40.9 | 0.12× | 0.06× | 9.05 GB | 8.087 | 0.2672 | 62.40% | 77.51% | 55.72% |
 | + W4A16 weights (4c) | `phase4-w4a16` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | vanilla vLLM (ref) | _ | 703.2 | 2.09× | 1.00× | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -262,3 +263,52 @@ reference (10 prompts × 64 new tokens) is committed at
   long-running-decode workload would show the KV memory drop). Avoiding
   the prefill spike would require an INT4 prefill attention kernel —
   scope beyond Phase 4.
+
+**4c notes** (W4A16 weight integration — memory win, batch-sensitive latency):
+
+- Patch (`integration/w4a16_patch.py`): `QuantizedLinear` stores packed INT4
+  weights (`[K/8, N] int32`) + per-channel groupwise scales (`[n_groups, N]
+  fp16`, group=128) — the Phase 3 scheme. `patch_model_w4a16(model)` walks
+  the 32 decoder layers and replaces all 7 projections per layer
+  (q/k/v/o_proj on attention, up/gate/down_proj on MLP) — 224 Linears total.
+  `embed_tokens` and `lm_head` stay fp16 (no decode dominance, and lm_head
+  may share weights with embed).
+- `QuantizedLinear.forward` dispatches:
+  - M < 256 (decode and small batched-decode): `llmik_cuda.w4a16_gemm`,
+    which routes to Phase 3c's decode-optimized kernel at M=1 and to the
+    Phase 3b naive kernel at M > 1.
+  - M ≥ 256 (prefill): unpack INT4 → multiply by scale → fp16 weight,
+    then `torch.matmul` (cuBLAS). The naive kernel's M-cost crosses cuBLAS
+    around M ~ 256 on this GPU.
+- **Memory win, large and immediate.** After `patch_model_w4a16`:
+  weight VRAM goes from **16.06 GB → 5.70 GB** (10.36 GB saved on weights;
+  the residual ~2 GB is embed + lm_head, still fp16). Peak during a generate
+  call (the row above): **9.05 GB vs vanilla 18.50 GB — 51% reduction.**
+  The headline memory result of Phase 4.
+- **Accuracy cost compounds with 4b's KIVI noise.** MMLU 68.32 → 62.40
+  (-5.92 pp); HellaSwag 79.51 → 77.51 (-2.00 pp); ARC-C 60.84 → 55.72
+  (-5.12 pp); PPL 7.055 → 8.087 (+1.03); greedy_match 0.27. The Phase 3
+  kernel-level rel-err (42% on synthetic gaussians) softened to a few-percent
+  PPL hit on real activations, as predicted; the MMLU drop is in the
+  range modern PTQ papers report for similar bit-widths without recovery
+  techniques (GPTQ / AWQ both narrow this gap, but neither is implemented
+  here).
+- **Tokens/sec at batch=16 (the locked workload): 40.9 vs vanilla 335.8 —
+  0.12×.** This is a regression. **Root cause:** the Phase 3 decode-optimized
+  kernel (`w4a16_gemm_decode_kernel`) is M=1-only; the launcher falls back
+  to the Phase 3b naive kernel for M > 1, and the naive kernel does not
+  exploit batch parallelism (its M-cost grows linearly per Phase 3 notes).
+  Phase 3 RESULTS explicitly flagged this: *"batched-decode M > 1 is
+  integration concern (Phase 4)"* — and 4c is where it surfaces.
+- **Tokens/sec at batch=1 (per-request decode, where the kernel's design
+  assumption holds): 56.9 vs vanilla 48.9 — 1.16×.** Matches the shape of
+  Phase 3c's kernel-level wins. The W4A16 win is real *for the design point
+  the kernel was built for*.
+- **What this teaches.** A decode-shape kernel optimized for M=1 doesn't
+  automatically extend to batched-decode serving. Production W4A16 kernels
+  (Marlin, AWQ's GEMM-V2, GPTQMarlin in vLLM) all have M-aware fast paths
+  for `M ∈ [1, ~128]` — that's what gives them headline tok/s wins at the
+  batched-serving point. Building an M-aware batched-decode W4A16 kernel
+  is a clean Phase 5 follow-up; the Phase 4c integration proves the rest
+  of the plumbing (quant offline, packed loading, forward dispatch, accuracy
+  characterization) is correct and ready for that next step.

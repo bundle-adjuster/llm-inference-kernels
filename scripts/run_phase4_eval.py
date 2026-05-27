@@ -38,6 +38,10 @@ from integration.attention_patch import (
     patched_kivi_int4_sdpa,
 )
 from integration.kv_int4_cache import Int4KIVICache
+from integration.w4a16_patch import (
+    patch_model_w4a16,
+    quantized_weight_bytes,
+)
 from run_e2e_eval import run_e2e_eval                          # noqa: E402
 from run_lm_eval import run_eval as run_lm_eval, DEFAULT_TASKS  # noqa: E402
 
@@ -48,7 +52,8 @@ STEP_TO_CONFIG_NAME = {
     "4c": "phase4c_w4a16",     # 4c path -- patch wiring lands in Phase 4c
 }
 
-GROUP_SIZE = 32  # KIVI K group_size (Phase 2c convention)
+GROUP_SIZE = 32       # KIVI K group_size (Phase 2c convention)
+W4A16_GROUP_SIZE = 128  # W4A16 weight group_size along K (Phase 3 convention)
 
 
 def _run_step_4a(model, tokenizer, config_name, args):
@@ -91,6 +96,42 @@ def _run_step_4b(model, tokenizer, config_name, args):
             run_lm_eval(model=model, tokenizer=tokenizer,
                         config_name=config_name,
                         tasks=DEFAULT_TASKS, limit=args.limit)
+
+
+def _run_step_4c(model, tokenizer, config_name, args):
+    """4c: W4A16 weights + INT4 KIVI cache + fused attention stacked.
+
+    Quantizes the model's projection weights in-place (W4A16) and re-uses the
+    4b patch stack for KV-cache compression + decode attention dispatch.
+    Reports the quantized-weight memory savings up front.
+    """
+    print("  patching model with W4A16 (this takes ~15-30s)...")
+    pre_vram = torch.cuda.memory_allocated() / 1e9
+    n_replaced = patch_model_w4a16(model, group_size=W4A16_GROUP_SIZE)
+    post_vram = torch.cuda.memory_allocated() / 1e9
+    q_bytes = quantized_weight_bytes(model)
+    print(f"  replaced {n_replaced} linears; quantized weight storage: "
+          f"{q_bytes / 1e9:.2f} GB "
+          f"(vram before: {pre_vram:.2f} GB → after: {post_vram:.2f} GB)")
+
+    cache_factory = lambda: Int4KIVICache(
+        group_size=GROUP_SIZE, num_layers=N_LAYERS)
+
+    if not args.skip_e2e:
+        with patched_int4_decode_attention(group_size=GROUP_SIZE):
+            run_e2e_eval(model=model, tokenizer=tokenizer,
+                         config_name=config_name,
+                         skip_tokens_per_sec=args.skip_tokens_per_sec,
+                         cache_factory=cache_factory)
+
+    if not args.skip_lm_eval:
+        with patched_kivi_int4_sdpa(n_kv_heads=N_KV_HEADS,
+                                    group_size=GROUP_SIZE):
+            run_lm_eval(model=model, tokenizer=tokenizer,
+                        config_name=config_name,
+                        tasks=DEFAULT_TASKS, limit=args.limit)
+    # Note: model is permanently quantized after this call — reload from disk
+    # if you need fp16 weights again.
 
 
 def _run_step_vanilla(model, tokenizer, config_name, args):
@@ -144,7 +185,7 @@ def main() -> None:
     elif args.step == "4b":
         _run_step_4b(model, tokenizer, config_name, args)
     elif args.step == "4c":
-        raise NotImplementedError("4c (W4A16) — coming after 4b lands")
+        _run_step_4c(model, tokenizer, config_name, args)
 
     print(f"\n== {config_name} eval complete ==")
 
