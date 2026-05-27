@@ -180,7 +180,7 @@ reference (10 prompts × 64 new tokens) is committed at
 |--------|--------|-----------|------:|--------:|----------:|----:|-------:|-----:|----------:|------:|
 | **vanilla HF** (Phase 4 baseline) | `phase4-eval-prep` | 335.8 | 1.00× | 0.48× | 18.50 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
 | + fused attention (4a) | `phase4-attention` | 344.1 | 1.025× | 0.49× | 18.57 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
-| + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | 521.7 | 1.55× | 0.74× | 18.41 GB | 7.256 | 0.5047 | 67.29% | 79.07% | 61.43% |
 | + W4A16 weights (4c) | `phase4-w4a16` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | vanilla vLLM (ref) | _ | 703.2 | 2.09× | 1.00× | n/a | n/a | n/a | n/a | n/a | n/a |
 
@@ -219,3 +219,46 @@ reference (10 prompts × 64 new tokens) is committed at
 - Peak VRAM up 0.07 GB = the un-expansion buffer (~66 MB). Negligible
   vs total. Avoiding it would require subclassing `LlamaSdpaAttention`
   to skip `repeat_kv` — deferred (not worth the code surface for 0.4%).
+
+**4b notes** (KV-cache compression integration):
+- Two patches working together:
+  - `Int4KIVICache` (`integration/kv_int4_cache.py`): a real `transformers.Cache`
+    subclass that stores K as packed INT4 + per-channel groupwise scales
+    (group=32) and V as packed INT4 + per-token scales — the KIVI scheme
+    proven in Phase 2c. A small fp16 residual buffer holds tokens not yet in
+    a full group; once it reaches `group_size`, the chunk is quantized into
+    the packed storage.
+  - `patched_int4_decode_attention` (in `integration/attention_patch.py`):
+    replaces `LlamaSdpaAttention.forward` so at decode (q_len=1) it bypasses
+    `repeat_kv` + SDPA entirely, calling our `decode_attention_int4` kernel
+    on the cache's packed tensors directly. Prefill (q_len>1) falls back to
+    the original forward — `cache.update()` returns dequantized fp16 K/V so
+    the SDPA path sees KIVI-noisy attention inputs.
+  - For lm-evaluation-harness (which doesn't pass `past_key_values` through
+    `HFLM`), a separate context (`patched_kivi_int4_sdpa`) rebinds `F.sdpa`
+    to do the same KIVI quantize-and-dequantize on K/V before the original
+    SDPA call. Identical math to the cache path → identical noise pattern,
+    so the lm-eval numbers reflect the same KIVI accuracy hit the cache
+    path produces.
+- Accuracy hit is small and in line with KIVI literature: **MMLU -1.03 pp**
+  (68.32 → 67.29), **HellaSwag -0.44 pp**, **ARC-C +0.59 pp** (noise; small
+  set), **PPL +0.20** (closely matches Phase 2c's kernel-level +0.196 — a
+  validation that the integration faithfully reproduces the kernel's noise
+  characteristics). `greedy_match_rate` drops to 0.50 because the small
+  per-token logit noise from KIVI flips argmax choices a few tokens in,
+  and greedy decoding compounds those flips — this is a property of
+  KIVI + greedy sampling, not an integration bug. PPL captures the meaningful
+  next-token-prediction quality, which moves only ~2.8%.
+- Tokens/sec: **1.55× over vanilla HF** (521.7 vs 335.8). The kernel-level
+  Phase 2c INT4 attention was 1.29× over our v3 fp16; the integrated speedup
+  is bigger because the forward replacement *also* skips `repeat_kv` and
+  the SDPA dispatch overhead, on top of the int4 kernel win itself.
+- Peak VRAM: essentially unchanged (-0.09 GB). The INT4 cache really does
+  store ~0.27× the bytes of an fp16 cache (Phase 2 proved this and the
+  CUDA `quantize_*_int4` kernels here produce the same layout). But peak
+  is dominated by prefill, where `cache.update()` materializes the full
+  fp16 K/V via `_materialize_fp16` for the SDPA path. After prefill ends,
+  steady-state decode memory is mostly the packed storage (so a true
+  long-running-decode workload would show the KV memory drop). Avoiding
+  the prefill spike would require an INT4 prefill attention kernel —
+  scope beyond Phase 4.

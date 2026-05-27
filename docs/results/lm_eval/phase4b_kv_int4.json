@@ -1,0 +1,53 @@
+{
+  "config_name": "phase4b_kv_int4",
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "limit": null,
+  "tasks": [
+    {
+      "name": "hellaswag",
+      "num_fewshot": 0
+    },
+    {
+      "name": "arc_challenge",
+      "num_fewshot": 25
+    },
+    {
+      "name": "mmlu",
+      "num_fewshot": 5
+    }
+  ],
+  "elapsed_sec": 2511.5,
+  "results": {
+    "hellaswag": {
+      "name": "hellaswag",
+      "alias": "hellaswag",
+      "sample_len": 10042,
+      "acc,none": 0.5941047600079665,
+      "acc_stderr,none": "N/A",
+      "acc_norm,none": 0.7906791475801633,
+      "acc_norm_stderr,none": "N/A",
+      "__elapsed_sec": 478.5
+    },
+    "arc_challenge": {
+      "name": "arc_challenge",
+      "alias": "arc_challenge",
+      "sample_len": 1172,
+      "acc,none": 0.5614334470989761,
+      "acc_stderr,none": "N/A",
+      "acc_norm,none": 0.6143344709897611,
+      "acc_norm_stderr,none": "N/A",
+      "__elapsed_sec": 629.2
+    },
+    "mmlu": {
+      "alias": "mmlu",
+      "name": "mmlu",
+      "sample_len": 14042,
+      "acc,none": 0.6729098419028628,
+      "acc_stderr,none": "N/A",
+      "sample_count": {
+        "acc,none": 14042
+      },
+      "__elapsed_sec": 1403.9
+    }
+  }
+}
