@@ -313,23 +313,38 @@ reference (10 prompts × 64 new tokens) is committed at
   of the plumbing (quant offline, packed loading, forward dispatch, accuracy
   characterization) is correct and ready for that next step.
 
-**Phase 5 update** (batched-decode kernel; `phase5-batched-w4a16`).
-The 4c row above now reflects the Phase 5 result (the `w4a16_gemm`
-launcher routes M∈[2, 16] through `w4a16_gemm_batched_decode_kernel`).
-Numbers vs Phase 4c-as-committed (M=1 design point only):
+**Phase 5/6 update** (batched-decode kernel evolution).
+The 4c row above shows the current dispatch (Phase 6 v3 kernel for
+M ∈ [2, 16], Phase 3c v1 for M=1, Phase 3b v0 for M > 16). History:
 
-| Phase 4c at batch=16 | tok/s | Notes |
+| Phase 4c at batch=16 | tok/s | Note |
 |---|---:|---|
-| M=1 kernel only (commit `8882880`) | 40.9 | M=16 falls back to v0 naive — 16× weight bandwidth amplification |
-| + Phase 5 batched-decode kernel | **199.9** | **4.9× recovery; 0.60× vs vanilla HF (still gap to cuBLAS — tensor cores) ** |
+| M=1 kernel only (commit `8882880`) | 40.9 | M=16 fell back to v0 naive — 16× weight bandwidth amplification |
+| + Phase 5 v2 batched-decode kernel | 199.9 | 4.9× recovery; scalar fp32 FMA inner loop |
+| + **Phase 6 v3 tensor-core kernel** | **198.7** | Kernel-level 1.3-1.4× over v2, but e2e unchanged — host-side Python/dispatch overhead has moved into the gap |
 
-The Phase 5 kernel is correct (max abs err 0.25, mean rel 0.001 — same
-fp16 reduction-order noise as the M=1 kernel) and amortizes weight
-bandwidth across `BLOCK_M=16` rows as designed — at M ∈ [2, 16] it
-runs in a near-flat 200 µs/call (the work is BLOCK_M-sized regardless
-of actual M). It still loses to cuBLAS at M=16 by ~1.7× because cuBLAS
-uses **tensor cores** (fp16 MMA throughput) while ours uses scalar
-fp32 FMA accumulators. At RTX 4090's ~82 TFLOPs fp32 vs ~165 TFLOPs
-fp16 MMA, that's the residual gap; closing it would require an
-`mma.sync`-based rewrite, the natural Phase 6 follow-up. Memory
-savings (51% peak VRAM) and accuracy numbers are unchanged.
+**Kernel-level vs cuBLAS at M=16** (Phase 6 v3, the on-dispatch kernel):
+
+| Shape | cuBLAS fp16 | Phase 6 v3 | speedup |
+|---|---:|---:|---:|
+| QKV/O (4096×4096) | 56.8 µs | 152.5 µs | 0.37× |
+| MLP up/gate (4096×14336) | 135.8 µs | 167.2 µs | **0.81×** (closest to parity) |
+| MLP down (14336×4096) | 179.9 µs | 513.8 µs | 0.35× |
+
+Correctness: max abs err 0.25, mean rel err ~0.0001 (better than v2's
+0.001 — fp16 MMA accumulates cleanly in fp32). 51% peak VRAM win and
+all accuracy metrics are unchanged.
+
+**Why Phase 6 helps the kernel but not the e2e:**
+- Microbench: v3 single-call 153 µs, 7-call back-to-back (one layer's
+  worth) 173 µs/call — only 13% inter-call overhead, so launch overhead
+  isn't saturating us at the kernel level.
+- E2E: ~224 Linear calls per decode step. The kernel went from
+  ~64 ms/step (v2) → ~47 ms/step (v3), so 17 ms freed. But we measure
+  no e2e speedup → 17 ms of *something else* moved into that gap.
+- Best guess: per-`nn.Module.__call__` Python dispatch overhead (~5-30 µs
+  × 224 calls × 512 steps ≈ 5-30 seconds of host work across the run).
+  At Phase 5's kernel time the GPU was the bottleneck; at Phase 6's the
+  host is. **CUDA graphs / `torch.compile`** is the natural next step
+  to hide the host overhead — full discussion in
+  `docs/04-end-to-end-integration-journey.md`.

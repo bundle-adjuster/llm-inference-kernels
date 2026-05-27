@@ -550,6 +550,111 @@ M-rows-of-work — but the residual cuBLAS gap is a scalar-vs-tensor-core
 question, not a memory-pattern question. The fix is well-known (MMA),
 just out of this phase's scope.
 
+---
+
+## Phase 6 addendum — tensor-core W4A16 kernel
+
+Phase 5 left an open question: does swapping the scalar fp32 FMA inner
+loop for `mma.sync` (via the wmma C++ API) close the gap to cuBLAS at M=16?
+
+### What landed
+
+`w4a16_gemm_tc_kernel` in `kernels/quant/quant_matmul.cu`. Same M=16 batched-
+decode shape as v2, but the inner accumulate loop now uses wmma fragments
+with `mma.sync.aligned.m16n16k16` (fp16 inputs, fp32 accumulator). Each warp
+owns BLOCK_N=16 output columns (BLOCK_N_PER_WARP); 4 warps per block
+covers BLOCK_N=64. The dequantize-int4-to-fp16 step is unchanged: each warp
+writes its `[group_size, BLOCK_N_PER_WARP]` weight tile into shmem in
+row-major fp16, then 8 wmma calls per K-group consume it via
+`load_matrix_sync`.
+
+The launcher now routes `M ∈ [2, 16]` to v3 (tensor-core). v2 (scalar
+batched-decode) stays in the file for comparison/learning but isn't on the
+dispatch path.
+
+### Result — better than v2 at the kernel, no e2e win at the locked workload
+
+**Kernel-level vs cuBLAS fp16 (cuBLAS handles M>1 via tensor cores too,
+so this is tensor-core-to-tensor-core; the win/loss is about layout +
+overhead efficiency, not just hardware utilization):**
+
+| Shape | M=16 cuBLAS | M=16 ours (v3) | speedup | (Phase 5 v2 reference) |
+|---|---:|---:|---:|---:|
+| QKV/O (4096×4096) | 56.8 µs | 152.5 µs | 0.37× | (211 µs, 0.27×) |
+| MLP up/gate (4096×14336) | 135.8 µs | 167.2 µs | 0.81× | (239 µs, 0.58×) |
+| MLP down (14336×4096) | 179.9 µs | 513.8 µs | 0.35× | (686 µs, 0.26×) |
+
+Vs Phase 5 v2, v3 is **1.3–1.4× faster at the kernel level** consistently
+across shapes — the tensor-core benefit lands as expected. Still ~1.7×
+behind cuBLAS at M=16 on the QKV and MLP-down shapes; close (0.81×) on
+MLP up/gate.
+
+**Phase 4c e2e at batch=16 (3-run median, very stable):**
+
+| Config | tok/s |
+|---|---:|
+| Phase 5 v2 kernel | 199.9 |
+| **Phase 6 v3 kernel** | **198.7** |
+| (vanilla HF, reference) | 335.8 |
+
+The kernel improvement does **not** translate to e2e at this workload —
+both Phase 5 and Phase 6 give ~199 tok/s within run-to-run noise. The
+kernel went from 211 µs → 152 µs per call at the headline shape; 224
+Linears × 60 µs saved = ~13 ms saved per decode step, which *should*
+push tok/s from 199 to ~239. It doesn't.
+
+### Why the e2e didn't move
+
+A back-to-back microbenchmark of 7 same-shape `w4a16_gemm` calls (one
+layer's worth) shows 173 µs/call vs 153 µs single-call — only 13%
+overhead between back-to-back calls. So launch overhead alone isn't
+saturating us at this M.
+
+The likely cause is **Python/PyTorch dispatch overhead per Linear call.**
+`QuantizedLinear.forward` runs through nn.Module's `__call__`, reshape,
+contiguous(), the C-extension call, reshape. Each step is ~5–30 µs of
+host-side Python. With 224 Linears per decode step, that's ~5–10 ms
+of pure host work per step, on top of the GEMM time. At Phase 5 (~64 ms
+of kernel time per step), the kernel is the bottleneck and shrinking it
+matters. At Phase 6 (~47 ms of kernel time per step), Python overhead
+has grown to a similar fraction, and the saved kernel time is partially
+offset by the time the GPU spends idle while the Python loop catches up.
+This is the classic "kernel got faster but the framework caught up"
+result that motivates CUDA graphs / `torch.compile` / fused multi-Linear
+launchers.
+
+### What's still open
+
+- **Phase 7 candidate — capture decode with CUDA graphs.** If 5–10 ms/step
+  is host-side overhead, `cudaGraphCapture` around one decode step (or
+  using `torch.compile` with `mode="reduce-overhead"`) should cut it to
+  near-zero. That's where the Phase 6 kernel win would finally cash in.
+- **Phase 7 candidate — further W4A16 kernel work.** Closing the
+  remaining 1.7× gap to cuBLAS at QKV-shapes would need: (a) dequantize
+  directly into MMA-register layout to skip the shmem hop (saves shmem
+  traffic + a `__syncthreads`), (b) double-buffer shmem so dequant for
+  group g+1 overlaps MMA for group g. Both are Marlin-style optimizations.
+- **`ncu` profile** would tell us exactly which of host overhead vs
+  kernel-pipeline-stalls is the binding constraint for the e2e step.
+  Pending GPU clock lock + a quiet system.
+- **Calibration-aware quant (GPTQ / AWQ)** — accuracy recovery, still open.
+- **vLLM port** — still open.
+
+### Phase 6 lesson
+
+**A microbench win can be invisible end-to-end if a different bottleneck
+moves into the gap.** The Phase 6 tensor-core kernel does what its
+microbench says — it is 1.3-1.4× faster than the scalar Phase 5 kernel.
+But once the per-decode-step kernel time gets small enough that host-side
+Python dispatch becomes a similar order of magnitude, additional kernel
+speedup gets absorbed. The path forward is host-side: CUDA graphs or
+`torch.compile` to hide Python overhead behind the GPU work. Then the
+next kernel-level win actually shows up at the model level.
+
+The Phase 6 kernel is kept on the dispatch path: it doesn't hurt at any
+shape we measured, helps at the kernel level on every shape vs v2, and
+sets up an honest scaffold for the optimizations above.
+
 ## Reference workload reproduction
 
 Same harness as the prior phases:

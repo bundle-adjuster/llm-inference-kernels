@@ -171,22 +171,59 @@ Phase 6.
 
 ---
 
-## Phase 6 — Tensor-core W4A16 (`mma.sync`)
+## Phase 6 — Tensor-core W4A16 (`mma.sync`)  *(complete; kernel win, no e2e move)*
 
-Close the remaining ~1.7× gap to cuBLAS at M=16. Rewrite the Phase 5
-batched-decode kernel's inner loop to use `mma.sync.aligned` (PTX MMA,
-fp16 inputs with fp32 or fp16 accumulator, 16×8×16 shape on sm_89). Keep
-Phase 5's threading model (4 warps, K-split-across-warps, BLOCK_M=16,
-BLOCK_N=32) — only the inner accumulate-and-FMA path swaps.
+Built `w4a16_gemm_tc_kernel` using the wmma C++ API
+(`mma.sync.m16n16k16` fp16->fp32). Launcher routes M ∈ [2, 16] to v3.
 
-- [ ] `ldmatrix.sync` for loading the dequantized weight tile into the
-  MMA-required register layout
-- [ ] `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` for the FMA
-- [ ] Verify correctness vs the existing reference
-- [ ] Benchmark and re-run Phase 4c
+- [x] WMMA fragments + `load_matrix_sync` / `mma_sync` inner loop
+- [x] Correctness vs reference at M ∈ {1, 2, 4, 8, 16}: max abs 0.25,
+  mean rel ~0.0001 (better than v2)
+- [x] Benchmark: 1.3-1.4× over Phase 5 v2 across all Llama 3 shapes
+  (e.g. QKV/O M=16: 211 → 152 µs)
+- [x] Re-run Phase 4c: 199.9 → 198.7 tok/s — *unchanged* despite the
+  kernel win. Host-side Python/dispatch overhead now occupies the gap.
 
-**Exit criterion:** Phase 4c at batch=16 beats vanilla fp16 cuBLAS while
-preserving the 51% peak VRAM win and accuracy.
+**Outcome:** kernel quality improved; e2e at the locked workload is
+bottlenecked elsewhere. Closing the e2e gap is now a host-side problem.
+
+---
+
+## Phase 7 — Hide host overhead at decode
+
+Phase 6's kernel win is being absorbed by per-`nn.Module.__call__`
+Python dispatch overhead (estimated 5–30 µs × 224 Linears × 512 decode
+steps ≈ 5–30 s of host work across the run, on a total run of ~41 s).
+Several mutually compatible approaches:
+
+- [ ] **CUDA graphs.** Capture one decode step with
+  `torch.cuda.graph(...)` and replay it. The graph replays as a single
+  GPU command, hiding all the Python overhead between kernel launches.
+  Per-decode-step CUDA graph capture is what production decode engines
+  (vLLM, TGI) use.
+- [ ] **`torch.compile(model, mode="reduce-overhead")`.** Same idea
+  via TorchDynamo + CUDA graphs. Less invasive than manual capture; some
+  graph-break friction with our monkey-patched `LlamaSdpaAttention.forward`.
+- [ ] **`ncu` profile** of one decode step to actually confirm whether
+  the bottleneck is host overhead (kernel gaps in the timeline) vs
+  device-side stalls.
+
+**Exit criterion:** Phase 4c at batch=16 closes the gap to vanilla
+(>= 300 tok/s) while keeping the 51% peak VRAM win and the Phase 6
+accuracy numbers.
+
+---
+
+## Phase 8 — Further W4A16 kernel work *(only if Phase 7 unblocks visible wins)*
+
+The remaining ~1.7× kernel-level gap to cuBLAS (QKV/O and MLP down)
+would need Marlin-style optimizations:
+
+- [ ] Dequantize directly into MMA-register layout (skip the shmem hop +
+  one `__syncthreads`)
+- [ ] Double-buffer the weight shmem so dequant for group g+1 overlaps
+  the MMA for group g
+- [ ] Maybe larger BLOCK_M (32) with BLOCK_K tiling
 
 ---
 

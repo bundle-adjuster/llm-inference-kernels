@@ -1,18 +1,31 @@
 #include "quant/quant_matmul.cuh"
 #include "common/cuda_utils.cuh"
+#include <mma.h>
 
 // W4A16 GEMM kernels.
 // Layout & contract: kernels/quant/quant_matmul.cuh
 // Design: docs/03-quantized-matmul.md
 //
-// Two kernels in this file:
+// Four kernels in this file:
 //   v0 naive  (Phase 3b) — one warp per BLOCK_N=32 output tile; outer
-//             M loop. Catch-all; used when M > 1 in the launcher.
+//             M loop. Catch-all; used when M > 16 in the launcher.
 //   v1 decode (Phase 3c) — four-warp block per BLOCK_N=32 tile, K split
 //             across the 4 warps with a tiny shmem combine at the end;
 //             act cached in shared memory. Fast path for M = 1.
+//   v2 batched-decode (Phase 5) — same K-split-across-warps as v1, but
+//             each thread accumulates a length-BLOCK_M=16 vector of fp32
+//             partials. Per-warp act tile in shmem. Used for 2 <= M <= 16,
+//             scalar FP32 FMA inner loop.
+//   v3 tensor-core (Phase 6) — same M=16 BLOCK_M but inner loop uses
+//             `mma.sync` via wmma fragments (16x16x16 fp16->fp32). Each
+//             warp owns BLOCK_N=16 output columns; one warp = one MMA
+//             tile. Closes the cuBLAS gap at M=16 by using tensor cores
+//             on the dequantized weight stream.
 //
-// The launcher dispatches: M == 1 → v1 decode, else → v0 naive.
+// Launcher dispatch:
+//   M == 1            -> v1 decode
+//   M in [2, 16]      -> v3 tensor-core (v2 is kept for reference / comparison)
+//   M  > 16           -> v0 naive
 
 namespace {
 constexpr int BLOCK_N = 32;       // output columns per block (one warp's worth of lanes)
@@ -311,9 +324,164 @@ __global__ void w4a16_gemm_batched_decode_kernel(
 
 
 // ============================================================================
+// v3: tensor-core W4A16 GEMM. Phase 6.
+//
+// Same M=16 batched-decode shape as v2, but the inner accumulate loop uses
+// `mma.sync` via the wmma C++ API. Each warp owns BLOCK_N=16 output cols
+// (BLOCK_N_PER_WARP); 4 warps per block -> BLOCK_N=64 output cols per block.
+// No K-split across warps: each warp processes the full K independently
+// across its own col tile.
+//
+// Per K group (group_size=128 K positions):
+//   1. Cooperative load act tile [BLOCK_M=16, group_size] into shmem (shared
+//      across all warps in the block).
+//   2. Each warp dequantizes its [group_size, BLOCK_N_PER_WARP] weight tile
+//      (int4 + per-channel-groupwise scale -> fp16) into its slice of
+//      shared memory.
+//   3. Each warp loops over the group_size axis in WMMA_K=16 chunks (8 iters
+//      per group). One `mma.sync.m16n16k16.row.row.f32.f16.f16.f32` per
+//      inner step, accumulating into the warp's c_frag (fp32, [16, 16]).
+//   4. After all K groups, convert c_frag to fp16 and store to global.
+//
+// Why this beats v2 at M=16: tensor cores deliver fp16 MMA throughput
+// (~165 TFLOPs on sm_89) vs scalar fp32 FMA (~82 TFLOPs). At M=16 the
+// per-block work is large enough that the FMA throughput, not memory,
+// is the bottleneck for the int4 weight stream (v2 was compute-bound at
+// 117 GB/s on int4 weights vs cuBLAS at 812 GB/s on fp16). Tensor cores
+// unblock that compute ceiling.
+//
+// Shared memory layout (dynamic):
+//   [BLOCK_M  * group_size           half ]  act_smem (shared across warps)
+//   [WARPS    * group_size * BLOCK_N_PER_WARP  half ]  weight_smem (per-warp tiles)
+//   [BLOCK_M  * BLOCK_N              half ]  output_smem (reuses act after K loop)
+// ============================================================================
+
+using namespace nvcuda::wmma;
+
+constexpr int TC_BLOCK_M       = 16;
+constexpr int TC_BLOCK_N_PER_WARP = 16;
+constexpr int TC_WMMA_M        = 16;
+constexpr int TC_WMMA_N        = 16;
+constexpr int TC_WMMA_K        = 16;
+constexpr int TC_WARPS         = 4;
+constexpr int TC_BLOCK_N       = TC_WARPS * TC_BLOCK_N_PER_WARP;  // = 64
+
+__global__ void w4a16_gemm_tc_kernel(
+    const half* __restrict__ act,                  // [M, K]
+    const uint32_t* __restrict__ weight_packed,    // [K/PACK, N]
+    const half* __restrict__ scales,               // [n_groups, N]
+    half* __restrict__ out,                        // [M, N]
+    int M, int N, int K, int group_size) {
+
+    constexpr int THREADS = TC_WARPS * 32;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane    = tid & 31;
+
+    extern __shared__ char smem[];
+    half* act_smem    = reinterpret_cast<half*>(smem);                       // [BLOCK_M, group_size]
+    half* weight_smem = act_smem + TC_BLOCK_M * group_size;                  // [WARPS][group_size, BLOCK_N_PER_WARP]
+
+    const int block_n_start = blockIdx.x * TC_BLOCK_N;
+    const int warp_n_start  = block_n_start + warp_id * TC_BLOCK_N_PER_WARP;
+
+    // Per-warp accumulator. fp32 to avoid overflow across many K positions.
+    fragment<accumulator, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    const int n_groups = K / group_size;
+
+    half* my_weight_smem = weight_smem
+        + warp_id * group_size * TC_BLOCK_N_PER_WARP;
+
+    for (int g = 0; g < n_groups; ++g) {
+        const int k_start = g * group_size;
+
+        // (1) Cooperative load act tile [BLOCK_M, group_size]
+        for (int idx = tid; idx < TC_BLOCK_M * group_size; idx += THREADS) {
+            const int m     = idx / group_size;
+            const int k_off = idx % group_size;
+            act_smem[m * group_size + k_off] = (m < M)
+                ? act[m * K + k_start + k_off]
+                : __float2half(0.0f);
+        }
+
+        // (2) Each warp dequantizes its [group_size, BLOCK_N_PER_WARP] weight tile
+        const int tile_elems = group_size * TC_BLOCK_N_PER_WARP;
+        for (int idx = lane; idx < tile_elems; idx += 32) {
+            const int k             = idx / TC_BLOCK_N_PER_WARP;
+            const int n_col_in_warp = idx % TC_BLOCK_N_PER_WARP;
+            const int n_col         = warp_n_start + n_col_in_warp;
+            const bool valid        = (n_col < N);
+
+            const int      k_pack    = (k_start + k) / PACK;
+            const int      k_in_pack = k % PACK;
+            const uint32_t packed    = valid
+                ? weight_packed[k_pack * N + n_col]
+                : 0u;
+            const int      nibble    = (static_cast<int32_t>(packed)
+                                        << (28 - k_in_pack * 4)) >> 28;
+            const float    scale_v   = valid
+                ? __half2float(scales[g * N + n_col])
+                : 0.0f;
+            my_weight_smem[k * TC_BLOCK_N_PER_WARP + n_col_in_warp] =
+                __float2half(static_cast<float>(nibble) * scale_v);
+        }
+        __syncthreads();
+
+        // (3) Inner loop: BLOCK_K=group_size processed in WMMA_K=16 chunks
+        fragment<matrix_a, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, half, row_major> a_frag;
+        fragment<matrix_b, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, half, row_major> b_frag;
+
+        const int wmma_steps = group_size / TC_WMMA_K;
+        #pragma unroll 1
+        for (int wk = 0; wk < wmma_steps; ++wk) {
+            // act tile is laid out [BLOCK_M, group_size] row-major; ldm = group_size
+            load_matrix_sync(a_frag, act_smem + wk * TC_WMMA_K, group_size);
+            // weight tile is laid out [group_size, BLOCK_N_PER_WARP] row-major; ldm = BLOCK_N_PER_WARP
+            load_matrix_sync(b_frag,
+                             my_weight_smem + wk * TC_WMMA_K * TC_BLOCK_N_PER_WARP,
+                             TC_BLOCK_N_PER_WARP);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();  // before next group writes weight_smem
+    }
+
+    // (4) Convert fp32 accumulator to fp16 and stage in shmem (reuses act_smem
+    // since the K loop is done)
+    half* output_smem = act_smem;  // [WARPS * BLOCK_M * BLOCK_N_PER_WARP] half — but layout is
+                                   // per-warp [BLOCK_M, BLOCK_N_PER_WARP], stacked along warp_id.
+    fragment<accumulator, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, half> c_out_frag;
+    #pragma unroll
+    for (int i = 0; i < c_frag.num_elements; ++i) {
+        c_out_frag.x[i] = __float2half(c_frag.x[i]);
+    }
+    store_matrix_sync(
+        output_smem + warp_id * TC_BLOCK_M * TC_BLOCK_N_PER_WARP,
+        c_out_frag, TC_BLOCK_N_PER_WARP, mem_row_major);
+    __syncthreads();
+
+    // Cooperative write to out[M, N] — only rows in [0, M).
+    for (int idx = tid; idx < M * TC_BLOCK_N; idx += THREADS) {
+        const int m            = idx / TC_BLOCK_N;
+        const int n_in_block   = idx % TC_BLOCK_N;
+        const int warp         = n_in_block / TC_BLOCK_N_PER_WARP;
+        const int n_in_warp    = n_in_block % TC_BLOCK_N_PER_WARP;
+        const int n_col        = block_n_start + n_in_block;
+        if (n_col < N) {
+            out[m * N + n_col] =
+                output_smem[warp * TC_BLOCK_M * TC_BLOCK_N_PER_WARP
+                            + m * TC_BLOCK_N_PER_WARP + n_in_warp];
+        }
+    }
+}
+
+
+// ============================================================================
 // Launcher: dispatch
 //   M == 1                   → v1 decode (3c)
-//   1 < M <= BLOCK_M (=16)   → v2 batched-decode (Phase 5)
+//   1 < M <= 16              → v3 tensor-core (Phase 6)  -- v2 retired from dispatch
 //   M > 16                   → v0 naive (3b)   — catch-all for prefill etc.
 // ============================================================================
 
@@ -332,17 +500,24 @@ void launch_w4a16_gemm(
             + WARPS * BLOCK_N * sizeof(float);
         w4a16_gemm_decode_kernel<<<grid, block, smem_bytes, stream>>>(
             act, weight_packed, scales, out, N, K, group_size);
-    } else if (M <= BATCHED_DECODE_BLOCK_M) {
-        // Batched decode (Phase 5).
-        constexpr int WARPS   = 4;
-        constexpr int THREADS = WARPS * 32;
-        constexpr int BLOCK_M = BATCHED_DECODE_BLOCK_M;
-        dim3 grid((N + BLOCK_N - 1) / BLOCK_N);
+    } else if (M <= TC_BLOCK_M) {
+        // Batched decode with tensor cores (Phase 6).
+        constexpr int THREADS = TC_WARPS * 32;
+        dim3 grid((N + TC_BLOCK_N - 1) / TC_BLOCK_N);
         dim3 block(THREADS);
+        // Shmem: act_smem (also reused as output_smem) + weight_smem
+        //  act:    BLOCK_M * group_size
+        //  output: WARPS * BLOCK_M * BLOCK_N_PER_WARP = BLOCK_M * BLOCK_N
+        //          (same total size — both contiguous from the same pointer)
+        //  weight: WARPS * group_size * BLOCK_N_PER_WARP
+        const size_t act_or_output_bytes =
+            static_cast<size_t>(TC_BLOCK_M) * TC_BLOCK_N * sizeof(half);
+        const size_t initial_act_bytes =
+            static_cast<size_t>(TC_BLOCK_M) * group_size * sizeof(half);
         const size_t smem_bytes =
-            static_cast<size_t>(WARPS) * BLOCK_M * group_size * sizeof(half)
-            + static_cast<size_t>(WARPS) * BLOCK_M * BLOCK_N * sizeof(float);
-        w4a16_gemm_batched_decode_kernel<<<grid, block, smem_bytes, stream>>>(
+            (act_or_output_bytes > initial_act_bytes ? act_or_output_bytes : initial_act_bytes)
+            + static_cast<size_t>(TC_WARPS) * group_size * TC_BLOCK_N_PER_WARP * sizeof(half);
+        w4a16_gemm_tc_kernel<<<grid, block, smem_bytes, stream>>>(
             act, weight_packed, scales, out, M, N, K, group_size);
     } else {
         // Catch-all for M > BLOCK_M (e.g. prefill at M=8192).
