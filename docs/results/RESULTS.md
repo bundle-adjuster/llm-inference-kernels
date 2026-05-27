@@ -159,8 +159,39 @@ variant would need M-fast inner loops and is a Phase 4 concern.
 
 ## End-to-end (Phase 4)
 
-| Config | Commit | Tokens/sec | Peak memory | vs vLLM | Quality |
-|--------|--------|-----------|-------------|---------|---------|
-| vanilla vLLM | _TBD_ | _TBD_ | _TBD_ | 1.00× | ref |
-| custom kernels | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| + KV compression | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+Goal of Phase 4: take the three kernels built in Phase 1–3 and plug them
+back into the actual Llama 3.1 8B Instruct model via HF monkeypatch, one at
+a time, and measure the accuracy / latency / memory tradeoff at each step.
+
+**Eval bar** (the GPTQ/AWQ/KIVI paper convention, plus our own end-to-end metrics):
+
+- **Standard accuracy** (`scripts/run_lm_eval.py`, lm-evaluation-harness):
+  MMLU 5-shot, HellaSwag 0-shot (acc_norm), ARC-Challenge 25-shot (acc_norm).
+- **End-to-end** (`scripts/run_e2e_eval.py`): WikiText-2 PPL (64 chunks × 2048
+  tok), greedy-token match rate on 10 fixed prompts vs vanilla reference,
+  decode tokens/sec on the LOCKED workload (batch=16, prompt=512, gen=512),
+  peak VRAM.
+
+Per-config JSON outputs in `lm_eval/` and `e2e_eval/`. The vanilla greedy
+reference (10 prompts × 64 new tokens) is committed at
+`e2e_eval/vanilla_reference_outputs.json` — 4a/4b/4c match against it.
+
+| Config | Branch | Tokens/sec | vs HF | vs vLLM | Peak VRAM | PPL | greedy | MMLU | HellaSwag | ARC-C |
+|--------|--------|-----------|------:|--------:|----------:|----:|-------:|-----:|----------:|------:|
+| **vanilla HF** (Phase 4 baseline) | `phase4-eval-prep` | 335.8 | 1.00× | 0.48× | 18.50 GB | 7.055 | 1.0000 | 68.32% | 79.51% | 60.84% |
+| + fused attention (4a) | `phase4-attention` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| + INT4 KIVI KV cache (4b) | `phase4-kv-int4` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| + W4A16 weights (4c) | `phase4-w4a16` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| vanilla vLLM (ref) | _ | 703.2 | 2.09× | 1.00× | n/a | n/a | n/a | n/a | n/a | n/a |
+
+**4-prep notes** (vanilla baseline, this commit):
+- HF tokens/sec is slightly below the Phase 0 number (354.6) — same setup,
+  different measurement run; gap is within run-to-run noise on unlocked
+  clocks. Phase 4 deltas are measured against this 335.8 reference for
+  apples-to-apples (all four configs share an eval run).
+- Llama 3.1 8B Instruct accuracy on MMLU/HellaSwag/ARC-C agrees with
+  Meta's reported numbers (69.4 / 80.4 / 60.3) within ~1pp — gives us
+  confidence in the eval setup before any kernel goes in.
+- vanilla vLLM tokens/sec is the Phase 0 number; accuracy eval through
+  vLLM is deferred (no clean HFLM hook), and is not strictly needed for
+  the Phase 4 narrative — our kernels integrate into HF, not vLLM.
