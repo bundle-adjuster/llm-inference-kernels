@@ -68,6 +68,14 @@ Phase 1 makes the attention compute fast. Phase 2 shrinks the KV cache.
 >   for LayerNorm?
 > - In a 32-block model, how many distinct attention computations happen
 >   per decoded token?
+>
+> **Answers**
+> - Attention and the big matmuls dominate inference cost. Attention is
+>   all-to-all and its cost grows with context length; matmuls move the
+>   bulk of the weights from HBM every step. LayerNorm is cheap
+>   elementwise work + a tiny reduce — even a "perfect" LayerNorm kernel
+>   would barely show up in the budget.
+> - 32 — one attention layer per block, computed once per decoded token.
 
 ---
 
@@ -209,6 +217,17 @@ indexed by Q-against-K similarity.**
 > - Why do we divide by `√d` before softmax? What goes wrong if we don't?
 > - If `Q` and `K` are identical and orthonormal across tokens, what is
 >   `softmax(Q·K^T / √d)` — close to identity or close to uniform?
+>
+> **Answers**
+> - `O = softmax(Q · K^T / √d) · V`.
+> - The variance of `q · k` is ~`d`. Without scaling, scores for large
+>   `d` get huge in magnitude, softmax saturates (one entry → 1, the
+>   rest → 0), gradients vanish, and the layer collapses to a hard
+>   one-hot lookup. Dividing by `√d` keeps the score variance ~1
+>   regardless of `d`.
+> - Close to uniform. `Q·K^T = I`, so each row's scaled scores are
+>   `[1/√d, 0, 0, …]`. For realistic `d` (e.g., 128), `1/√d ≈ 0.088`,
+>   so softmax is only mildly peaked — far from identity.
 
 ---
 
@@ -262,6 +281,14 @@ pair. That's the grid you saw in `grid(batch, n_heads)` in v0 → v3.
 >   inputs? Share outputs?
 > - If we have batch=8, n_heads=32, seqlen=4096, head_dim=128, how big
 >   is `Q` (in fp16)?
+>
+> **Answers**
+> - `head_dim = d / n_heads = 4096 / 32 = 128`.
+> - Heads have **separate weights** (each head has its own slice of
+>   `W_q, W_k, W_v`). They **share the input `x`** (all heads see the
+>   same token representation). Their **outputs are concatenated** and
+>   then jointly projected by the shared `W_o`.
+> - `8 · 32 · 4096 · 128 · 2 bytes = 268,435,456 bytes = 256 MiB`.
 
 ---
 
@@ -312,6 +339,17 @@ every kernel we wrote.
 > - For query head 17, which kv head does it index into?
 > - GQA saves memory; does it cost anything? (Hint: think about model
 >   quality, not compute.)
+>
+> **Answers**
+> - `8 · 128 · 2 = 2048 bytes per token` (per layer, for K alone; same
+>   again for V).
+> - `kv(17) = 17 / 4 = 4` (integer division). Query head 17 indexes KV
+>   head 4 (along with query heads 16, 18, 19).
+> - Yes — slightly less expressive K/V than full MHA, so model quality
+>   is a touch lower than a same-sized MHA model. In practice, models
+>   trained with GQA from scratch (Llama 3) recover almost all of this
+>   loss; the quality cost is small and the memory/bandwidth savings are
+>   large.
 
 ---
 
@@ -369,6 +407,18 @@ once per request.
 > - What's the wall-clock split between prefill and decode for a chat
 >   request that takes 512 input tokens and generates 256 tokens? (You
 >   need a rough mental model — don't compute exactly.)
+>
+> **Answers**
+> - `Q : [batch, n_heads, 1, head_dim]`. `seqlen_kv` is the number of
+>   tokens already in context (prompt length + previously decoded
+>   tokens). It grows by 1 every decode step.
+> - Tensor Cores are designed for MMA shapes with M, N, K ≥ 16. At
+>   decode, `M = 1` — you're doing a gemv, not a GEMM, so most TC
+>   silicon sits idle.
+> - Decode dominates. Prefill is one parallel pass over 512 tokens —
+>   compute-bound and well-tiled, often a few ms. Decode is 256 fully
+>   sequential steps, each ~ms, so it spends ~10–20× the wall-clock of
+>   prefill. Rough split: 5–10% prefill, 90–95% decode.
 
 ---
 
@@ -467,6 +517,20 @@ capacity* benefit.
 >   3 8B? Does it fit in 24 GB alongside the 16 GB of weights?
 > - If we go from fp16 KV to INT8 KV, the memory savings are obvious.
 >   What's the *bandwidth* savings during decode?
+>
+> **Answers**
+> - K and V for prior tokens are fixed once computed (they're
+>   projections of inputs that don't change). Q at step `t` is computed
+>   once from the new token's input and used only for that step's
+>   attention — there's nothing to accumulate.
+> - `16 · 4096 · 128 KiB/token = 8 GiB`. Adding 16 GB of weights gets
+>   us to exactly 24 GB. So technically yes — but with zero margin for
+>   activations, workspace, fragmentation, etc. In practice, *no*.
+> - Every decode step reads the entire KV cache from HBM. INT8 halves
+>   the bytes per element, so the per-step HBM bandwidth demand also
+>   halves. If the kernel is bandwidth-bound, that's a ~2× wall-clock
+>   speedup; if it's chain-bound (as v3 turns out to be), the bandwidth
+>   win doesn't translate to latency (see Phase 2b).
 
 ---
 
@@ -536,6 +600,20 @@ For a **system** win:
 >   we benchmark the kernel in isolation. Phase 4 integrates it.)
 > - How many times per decoded token does the attention kernel run for
 >   Llama 3 8B with batch=8?
+>
+> **Answers**
+> - ```
+>   s[j]   = scale · dot(q, K[j, :])         for j in 0..seqlen_kv-1
+>   m      = max_j s[j]
+>   p[j]   = exp(s[j] - m) / Σ_j exp(s[j] - m)
+>   out[d] = Σ_j p[j] · V[j, d]              for d in 0..head_dim-1
+>   ```
+> - Nothing yet. Phase 1/2 benchmark the kernel in isolation against
+>   PyTorch SDPA. Phase 4 wraps it into a full attention layer (with
+>   QKV projection, output projection, etc.) and integrates it into a
+>   real serving loop.
+> - `n_layers · n_heads · batch = 32 · 32 · 8 = 8192` invocations per
+>   decoded token.
 
 ---
 
@@ -637,6 +715,16 @@ These are the skills behind every commit in Phase 1, Phase 2, and Phase
 > Before reading further: when a kernel achieves "20% of peak HBM
 > bandwidth," does that mean it's fast, or slow? What would you need
 > to know to decide?
+>
+> **Answer**
+> It depends on whether the kernel is bandwidth-bound. If it is, 20%
+> of HBM peak is *slow* — there's 5× headroom on the limiting resource.
+> If it's chain-bound or compute-bound, 20% of HBM is *irrelevant* —
+> HBM isn't the ceiling, and pushing HBM utilization higher wouldn't
+> help. To decide, you also need the achieved compute (vs FLOPS peak)
+> and the per-iter dependency chain. The cheap proxy: would doubling
+> HBM bandwidth halve the kernel's runtime? If yes, slow. If no, the
+> 20% number isn't the limiter.
 
 ---
 
@@ -725,6 +813,14 @@ structure, same building blocks.
 > - On the RTX 4090's 128 SMs, what's the *minimum* number of SMs that
 >   would have to be active to host that workload? (Hint: at least one
 >   warp per used SM, but multiple blocks can share.)
+>
+> **Answers**
+> - 256 blocks × 1 warp/block = **256 warps**.
+> - With single-warp blocks, an SM can host up to ~16 blocks (the Ada
+>   block-slot cap for small blocks). So in principle, 256 / 16 = **16
+>   SMs** could hold the whole grid resident at once. In practice the
+>   scheduler spreads them more widely, but 16 is the lower bound for
+>   "all blocks resident."
 
 ---
 
@@ -799,6 +895,19 @@ computes — that reuse is what makes shmem caching worth it.
 >   shared memory but `weight` not?
 > - The 4090's HBM peak is 1008 GB/s. If a decode kernel reads 128 MB
 >   of KV per call, what's the *theoretical fastest* it could run?
+>
+> **Answers**
+> - Q is reused on every one of the `seqlen_kv` j-iterations. Streaming
+>   it from HBM each iter would burn bandwidth re-fetching the same
+>   bytes. Loading it into registers once means we pay for it once and
+>   reuse for free.
+> - `act` is reused by every output column the block computes (all 32
+>   lanes need the same activation vector for their dot products), so
+>   caching it in shmem cuts that reuse out of the L1 traffic budget.
+>   `weight` is touched once per inner iter and never re-read — caching
+>   it would be pure overhead.
+> - `128 MiB / 1008 GB/s ≈ 127 µs`. That's the floor if the kernel were
+>   perfectly bandwidth-bound on HBM.
 
 ---
 
@@ -897,6 +1006,21 @@ v3 attention kernel's entire dot-product reduction is one
 > - In Phase 1 v3, we said "redundant scalar work across the warp is
 >   free." Give a concrete example from a kernel where this principle
 >   matters.
+>
+> **Answers**
+> - 2× the cycles. The hardware serially executes both branches —
+>   first with the "taken" lanes active and the others masked off,
+>   then vice versa.
+> - Because `log2(32) = 5`. A butterfly reduction across 32 lanes pairs
+>   lanes at distances `16, 8, 4, 2, 1` — five halvings. After each
+>   step, twice as many lanes hold the partial sum; after step 5, all
+>   32 lanes hold the full sum.
+> - In v3, every lane computes `m_new = max(m_state, s_j)`, `α =
+>   exp(m_state - m_new)`, and the softmax update — even though every
+>   lane gets the same scalar answer. The "redundant" 31 lanes would
+>   otherwise sit idle at the next instruction issue; doing identical
+>   ALU work costs nothing. The wrong fix in v1 (moving the work to
+>   lane 0 with a broadcast) made it slower.
 
 ---
 
@@ -981,6 +1105,18 @@ extra warps would have helped hide latency, which they don't here.
 > - Phase 1 v3 has 33% occupancy and is faster than v2 at 100%
 >   occupancy. Explain this in one sentence.
 > - When would *adding* warps make the kernel slower?
+>
+> **Answers**
+> - `65536 / 60 = 1092 threads`, rounded down to a multiple of 32 →
+>   **1088 threads** (34 warps) resident.
+> - v3 is dependency-chain-bound, so the extra warps in v2 weren't
+>   hiding latency (they were stalling at `__syncthreads()`) — trading
+>   them away to shorten the chain by going to a single-warp block was
+>   a net win.
+> - When the extra warps cause register spills (forcing reloads from
+>   local memory), when they create shmem-bank contention, or when the
+>   kernel is already chain- or compute-bound so the new warps just add
+>   scheduling overhead without buying any latency hiding.
 
 ---
 
@@ -1057,6 +1193,19 @@ participate in the sync.
 >   `__syncthreads()` matter for performance?
 > - What goes wrong if `__syncthreads()` appears inside an `if` branch
 >   that only some threads take?
+>
+> **Answers**
+> - No. Each thread reads only the slot it wrote — there's no
+>   cross-thread dependency, so no barrier is needed.
+> - Because `__syncthreads()` is a *load barrier*: nvcc won't hoist a
+>   memory load above it. If the V load sits after the sync, V's HBM
+>   latency (hundreds of cycles) serializes into the per-iter chain.
+>   Manually issuing the load before the sync lets the compiler
+>   pipeline it — the value arrives by the time it's consumed in the
+>   FMA at the bottom of the iter.
+> - **Deadlock.** Threads that didn't take the branch never reach the
+>   sync; threads inside the branch wait forever for them. The block
+>   stalls and the kernel hangs (or hits a watchdog).
 
 ---
 
@@ -1149,6 +1298,22 @@ translate directly.
 >   than just removing a `__syncthreads()` would predict?
 > - Phase 2b (INT8 KV) halved KV bytes but didn't speed up the
 >   kernel. Where was the chain hiding the win?
+>
+> **Answers**
+> - `load K[j]` (prefetch V[j] beside it) → `dot product` →
+>   `warp_reduce_sum` → `online softmax update (m_new, α, exp(s_j -
+>   m_new))` → `FMA into o_state using prefetched V[j]` → state update
+>   → next iter. No syncs, no shmem hops.
+> - Removing the sync also removed the shmem write + shmem read it
+>   gated (the broadcast hop) — each shmem op is ~20 cycles, and the
+>   chain it shortened freed the surrounding instruction scheduling
+>   (load-pipeline pressure, in-flight load slots). The visible barrier
+>   was only part of what was on the chain.
+> - The chain (warp reduce → softmax → FMA) didn't shrink — only the K
+>   load did, which is a few cycles in a chain dominated by reductions
+>   and exponentials. The bytes mattered for memory footprint but not
+>   for per-iter latency. Chain-bound kernels don't care about smaller
+>   bytes alone.
 
 ---
 
@@ -1450,6 +1615,24 @@ relative to v0.
 >   roughly (count the syncs)?
 > - The kernel hits 15% of HBM peak. Is v0 bandwidth-bound? Use
 >   §2.8's framework to argue.
+>
+> **Answers**
+> - Phase 2 (softmax) needs the *complete* `s[0..seqlen_kv)` to find
+>   `max(s)` and `Σ exp(s − m)` before Phase 3 can run. Phase 3 also
+>   needs to read `p[j]` for every `j`. Per-thread registers only hold
+>   each thread's slice, so we need shmem to materialize the full
+>   vector for cross-thread / cross-phase access. Keeping partials in
+>   registers would block the cross-thread softmax reduction.
+> - Per `j`: K load → per-thread FMA → warp reduce + first
+>   `__syncthreads` → cross-warp combine → second `__syncthreads` →
+>   broadcast read → shmem write. Two sync barriers per iter — each
+>   acts as a load barrier and costs ~50+ cycles, plus the chain ops
+>   themselves. Roughly **~150–200 cycles per `j`**, dominated by the
+>   syncs.
+> - **No.** §2.8: doubling HBM bandwidth would not double v0's speed —
+>   the syncs would still be there. Achieved 15% of HBM peak is a
+>   symptom, not the cause: v0 is **chain-bound**, with two syncs per
+>   iter as the chain's longest serial stretch.
 
 ---
 
@@ -1545,6 +1728,17 @@ Self-consistent. The first `j` becomes the running state.
 > Without looking, write the online softmax recurrence on paper. Five
 > assignments: `m_new`, `α`, `l`, `o_acc[d]`, `m`. You'll re-derive
 > this many times in the rest of Part 3.
+>
+> **Answer**
+> ```
+> m_new    = max(m, s_j)
+> α        = exp(m - m_new)
+> l        = l · α + exp(s_j - m_new)
+> o_acc[d] = o_acc[d] · α + exp(s_j - m_new) · V[j, d]
+> m        = m_new
+> ```
+> Init with `m = -∞`, `l = 0`, `o_acc = 0`. After the loop, divide
+> `o_acc` by `l` to get the final output.
 
 ---
 
@@ -1688,6 +1882,21 @@ This lesson recurs:
 >   prefetch fix? With it?
 > - The "redundant exp" fix made v1 *slower*. State why in one sentence
 >   referencing §2.4.
+>
+> **Answers**
+> - *After* the `__syncthreads()`. The V load happens late in the body,
+>   inside the dependency chain that runs after the broadcast of `s_j`.
+>   Since `__syncthreads()` is a load barrier, nvcc can't hoist the V
+>   load above it.
+> - Without prefetch: load + chain are serial → **~550 cycles per iter**.
+>   With prefetch: V load issues at the top of the iter and runs in
+>   parallel with the ~50-cycle chain → load latency fully hidden →
+>   **~50 cycles per iter** (or whatever the longer of load and chain
+>   is, here capped by the chain).
+> - The 31 "redundant" lanes weren't doing anything else useful — under
+>   SIMT they execute the same instruction for free; moving the exp to
+>   lane 0 introduced serialization (only 1 active lane) and added shmem
+>   hops to broadcast the result.
 
 ---
 
@@ -1802,6 +2011,20 @@ warp slot pressure) all loosen. **Look at the chain, not the sync.**
 >   (Hint: race condition between iters.)
 > - The actual speedup (~570 µs saved) was larger than predicted
 >   (~150 µs from sync alone). What accounts for the rest?
+>
+> **Answers**
+> - **One** `__syncthreads()` per iter.
+> - Without double-buffering, iter `j+1`'s write to `reduce_smem` could
+>   land on slow warps that are still reading iter `j`'s value (the
+>   sync we dropped was what gated that). With two slots and slot
+>   selection by `j & 1`, the iter that writes a slot is always two
+>   iters away from the previous user of that slot, with the remaining
+>   sync gating the in-between iter — no race.
+> - Removing the broadcast shmem write + read (~20 cycles each × 4096
+>   iters ≈ 60 µs), plus secondary effects of the shorter chain —
+>   instruction scheduling, in-flight load slots, warp issue pressure
+>   all loosen when the chain shortens. Shortening a chain has
+>   compound benefits beyond the single visible op.
 
 ---
 
@@ -1900,6 +2123,18 @@ for shorter chain is a win.
 > - In v3, how many threads per block? How many warps?
 > - Why doesn't v3 need any `__syncthreads()`?
 > - State the v3 trade-off in one sentence, using §2.5's vocabulary.
+>
+> **Answers**
+> - **32 threads = 1 warp** per block.
+> - All cross-thread communication happens *within* a single warp via
+>   register-to-register `__shfl_xor_sync` operations. The warp is
+>   already in SIMT lockstep, so there's nothing across warps to
+>   synchronize — and shuffles carry an implicit warp sync via their
+>   mask argument.
+> - v3 trades **occupancy** (from 100% to 33%) for a **shorter per-iter
+>   dependency chain** (no syncs, no shmem hops); the lost warps weren't
+>   doing useful latency hiding in v2 (they were idle at syncs), so
+>   the trade is a 1.5× wall-clock win.
 
 ---
 
@@ -1972,6 +2207,23 @@ then reverted in `e39c97f`. `main` stays on v3.
 > - Why does split-K help in some workloads but hurt in v3's?
 > - When *would* you reach for split-K? (Hint: think about per-SM
 >   resource pressure.)
+>
+> **Answers**
+> - **Chain-bound.** Achieved 189 GB/s vs 1008 GB/s HBM peak = 19% —
+>   far from bandwidth peak. Per-iter ops are trivial — far from
+>   compute peak. Neither resource is the ceiling, so the per-iter
+>   serial chain is. Confirmed by v4's split-K failing: more SMs busy
+>   didn't help.
+> - Split-K helps when the workload is grid-undersized AND per-SM
+>   resources (compute, per-SM bandwidth) are the bottleneck. v3 is
+>   chain-bound — adding blocks doesn't shorten any individual chain,
+>   so the extra parallelism is pure overhead (launch + scratch +
+>   combine).
+> - When the grid is under-utilized (few blocks vs many SMs) *and* the
+>   kernel is bandwidth- or compute-bound per SM (so aggregate
+>   throughput goes up as more SMs work in parallel). E.g., small-N
+>   GEMMs at long-K, where each block has plenty of K work but there
+>   aren't enough output blocks to fill the GPU.
 
 ---
 
@@ -2030,6 +2282,24 @@ on v3.
 >   cp.async approach? Why does one help and the other hurt?
 > - State the conditions under which `cp.async` would help, in one
 >   sentence each.
+>
+> **Answers**
+> - Registers are per-thread and not addressable by other threads; an
+>   async copy needs a destination the hardware can write into
+>   asynchronously while threads are doing other work, and that has to
+>   be the shared / addressable memory space. Registers also have no
+>   "wait for completion" mechanism that pipelines naturally with
+>   async copies.
+> - v1's prefetch is a regular load issued early so nvcc can pipeline
+>   it directly into a register — no extra hop. v5's `cp.async` stages
+>   via shared memory: HBM → shmem → register → use, adding one shmem
+>   write + one shmem read per iter. v1 removed a serialization point;
+>   v5 added hops without removing serialization.
+> - (a) When per-iter compute is heavy enough to amortize the extra
+>   shmem hop (e.g., big GEMMs, prefill with Tensor Cores). (b) When
+>   the compiler-scheduled prefetching is leaving significant load
+>   latency exposed on the critical path that explicit pipelining could
+>   hide.
 
 ---
 
@@ -2164,6 +2434,17 @@ isn't obvious before measuring.
 > What does this imply for choosing between weight quantization (Phase
 > 3) and KV-cache quantization (Phase 2) in terms of which problem
 > they solve?
+>
+> **Answer**
+> KV cache stores K and V *per token* — every new token adds one row.
+> Weights are model parameters that exist independently of how long
+> the context is. So weight quantization (Phase 3) shrinks the model's
+> *static* footprint (fits bigger models on smaller GPUs, reduces
+> per-layer HBM traffic for the matmuls). KV quantization (Phase 2)
+> shrinks the *per-token* footprint (lets you scale batch size and
+> context length on a fixed model). Different bottlenecks, different
+> levers — both are needed for serving long-context, multi-user
+> workloads.
 
 ---
 
@@ -2223,6 +2504,19 @@ magnitudes. Which brings us to §4.3.
 > - The error bound `scale / 2` is *per-element*. Why doesn't that
 >   mean a kernel using these dequantized values has bounded relative
 >   error on the final output? (Hint: think about the dot product.)
+>
+> **Answers**
+> - `1 / (2 · 7) ≈ 7.14%` of absmax.
+> - INT4 scale = `2.0 / 7 ≈ 0.286`. `round(0.05 / 0.286) = round(0.175)
+>   = 0`, dequant = 0. The value collapses to zero — **100% relative
+>   error** on the 0.05 element.
+> - The output is a sum (dot product, weighted sum of V's). Per-element
+>   error bounds give a worst-case sum error of `O(N · scale/2)`, which
+>   can be large relative to the *true* sum if many elements cancel
+>   each other in the true result but their errors don't. And per-element
+>   bounds are relative to `absmax`, not to the actual element value —
+>   small elements can suffer arbitrarily large *relative* per-element
+>   errors, which propagate into the sum.
 
 ---
 
@@ -2269,6 +2563,14 @@ This is an empirical question about the data, not a math question.
 > - You're told that for some tensor, the magnitudes vary *both*
 >   between tokens AND between channels. Which scheme is better, or
 >   should you do both (per-token-per-channel)?
+>
+> **Answers**
+> - `4096 / 32 = 128` groups.
+> - Do both — one scale per `(group along seqlen, channel along
+>   head_dim)`. Each axis gets its own flexibility, so neither inter-
+>   token nor inter-channel variation crushes the resolution. The cost
+>   is more scale storage (one fp16 per `(group, channel)` instead of
+>   per group or per channel alone), but it's still tiny vs the data.
 
 ---
 
@@ -2308,6 +2610,15 @@ We measured this directly in Phase 2d (see §4.10).
 > If we tried per-channel V instead of per-token V (both at INT4),
 > would you expect quality to be better, worse, or about the same as
 > KIVI's per-token V? Why?
+>
+> **Answer**
+> About the same, perhaps marginally worse. KIVI's measurement is that
+> V doesn't have per-channel outliers — magnitudes are roughly uniform
+> across `head_dim`. So per-channel V buys no representation benefit
+> over per-token V, while it costs more scale storage and (importantly)
+> breaks the §4.6 scale-folding trick for the V FMA (which depends on
+> the V scale being a scalar across `d`). Net: same quality, worse
+> kernel cost.
 
 ---
 
@@ -2411,6 +2722,19 @@ It would NOT work for per-channel scales** (§4.8 explains).
 > - For the V FMA fold, why is `p_j` also a scalar (across `d`)?
 > - In Phase 1 v3 (no quantization), is there a "scale" the same
 >   linearity could fold? (Hint: yes — what's `softmax_scale`?)
+>
+> **Answers**
+> - `q · k = Σ_d q[d] · k[d] = Σ_d q[d] · (k_int[d] · k_s) = k_s · Σ_d
+>   q[d] · k_int[d]`. The scalar property of `k_s` (no `d` index) is
+>   what lets us pull it outside the sum over `d` — if it were `k_s[d]`,
+>   it'd stay inside and we'd need per-lane multiplies.
+> - `p_j` comes from the online softmax: `exp(s_j - m_new) / l`. `s_j`
+>   is a single scalar (the dot product result), so `p_j` is a single
+>   scalar for that iteration, independent of `d`. It then multiplies
+>   `V[j, d]` elementwise across all `d`-lanes.
+> - Yes — `softmax_scale = 1/√head_dim` is a scalar across `d`. v3
+>   already folds it: `s_j = warp_reduce_sum(partial) · softmax_scale`,
+>   one multiply at the end of the dot product, not one per lane.
 
 ---
 
@@ -2460,6 +2784,14 @@ half the memory, no quality loss. The wins come from infrastructure
 >   4090), would INT8 KV speed it up? By roughly how much?
 > - State, in one sentence, the lesson that recurs across Phase 1 v4,
 >   Phase 1 v5, and Phase 2b.
+>
+> **Answers**
+> - Yes — roughly **2×**. Halving the bytes per element halves the
+>   bytes moved through HBM; if HBM is the ceiling, runtime roughly
+>   halves.
+> - Changing the bytes (or the SM count, or the in-flight load count)
+>   doesn't speed up a chain-bound kernel — you have to shorten the
+>   per-iter dependency chain itself.
 
 ---
 
@@ -2571,6 +2903,20 @@ shorter K and V loads (uint16 vs uint32) because of the packed format.
 >   vs the per-group-pre-scaled version? Amortise.
 > - The trick wouldn't work for *per-token* K scales (one per token).
 >   Why? (Hint: how often does the scale change?)
+>
+> **Answers**
+> - Because the pre-scaled `q_scaled = q · k_scale[g, :]` only stays
+>   valid for as long as `k_scale[g, :]` doesn't change. If the K scale
+>   changed within a group, we'd have to re-scale `q` on every iter that
+>   the scale changed — no amortization, no savings.
+> - Naive: **4 multiplies per thread per iter** (one per lane, every
+>   iter). Pre-scaled: **4 multiplies per group / 32 iters per group =
+>   0.125 multiplies per iter** — a 32× reduction in K-dequant multiplies
+>   along the chain.
+> - Per-token K scales change every iter (every new token). There's no
+>   "group" of iters with constant scale to amortize across — you'd be
+>   re-pre-scaling `q` every iter, which is identical work to naive
+>   per-lane dequant.
 
 ---
 
@@ -2618,6 +2964,18 @@ fp16 v3.** Wins both axes.
 > - If we had INT4 with *per-token* K scales (no KIVI), would the
 >   per-group pre-scale-q trick apply? Would the kernel be faster than
 >   INT8?
+>
+> **Answers**
+> - INT8 only shrank bytes (chain unchanged → latency unchanged),
+>   while INT4 KIVI shrank bytes *and* lifted the K-scale load out of
+>   the per-iter chain via per-group pre-scaling, which shortened the
+>   chain itself.
+> - No — the trick wouldn't apply (the scale changes every iter, so
+>   pre-scaling `q` once and reusing it isn't possible). Without that
+>   trick, the kernel still pays per-iter K-scale loads + per-iter
+>   K-dequant — chain isn't shorter than INT8's, so latency would land
+>   near INT8/v3, not better. You'd get the memory win but not the
+>   speed win.
 
 ---
 
@@ -2710,6 +3068,19 @@ The §4.4 prediction — that per-channel K matters at INT4 specifically
 >   what's the math both paths implement?)
 > - At INT8, naive per-token K (not KIVI) would presumably also work.
 >   Did we measure it? Why or why not? (Hint: design choice.)
+>
+> **Answers**
+> - Both paths compute `softmax(Q · dequant(K_q)^T / √d) · dequant(V_q)`.
+>   The CUDA kernel fuses the dequant inside attention; the patched
+>   SDPA does the dequant up front and passes the (round-tripped) fp16
+>   K, V to the unfused SDPA. The values flowing into softmax are
+>   identical (modulo trivial fp16 rounding from the dequant), so
+>   model-level perplexity is the same.
+> - The Phase 2 INT8 setup *uses* per-token K and per-token V — that's
+>   what was measured (Δppl = +0.0008, essentially lossless). Per-channel
+>   K wasn't needed at INT8 because INT8's resolution (`qmax = 127`) is
+>   high enough that outlier crushing is a non-issue (§4.4). The
+>   complexity of per-channel K was reserved for INT4 where it matters.
 
 ---
 
@@ -2864,6 +3235,20 @@ takes fp16 activations and INT4 weights, produces fp16 outputs.
 >   step"? What kind of quality loss does each scheme tolerate?
 > - For Llama 3 8B at fp16, what's larger: the weights or the KV cache
 >   at `batch=8, seqlen_kv=4096`? At `batch=32, seqlen=8192`?
+>
+> **Answers**
+> - Offline quantization is unconstrained by latency — you can run
+>   calibration sets, search for per-channel scales, even do
+>   gradient-based refinement. Streaming quantization has to fit
+>   inside the decode kernel's budget, so it's typically just per-tensor
+>   absmax + round + pack — cheap. Offline can afford more aggressive
+>   schemes (lower bits, more sophisticated calibration) because the
+>   cost is paid once and amortized across all inferences.
+> - At `b=8, s=4096`: KV cache = `8 · 4096 · 128 KiB ≈ 4 GiB`, weights
+>   ≈ 14 GB → **weights dominate**. At `b=32, s=8192`: KV cache =
+>   `32 · 8192 · 128 KiB ≈ 32 GiB`, weights ≈ 14 GB → **KV dominates**.
+>   This is the crossover that makes KV quantization (Phase 2) the
+>   relevant lever at serving scale.
 
 ---
 
@@ -2901,6 +3286,14 @@ factor of 4 storage reduction.
 > **Checkpoint 5.2**
 > Compare the §4.4 KIVI K recipe to the §5.2 W4A16 recipe. List two
 > ways they're the same and one way they differ.
+>
+> **Answer**
+> Same: (1) **per-channel groupwise structure** — one scale per
+> `(group, output-channel)`. (2) **Symmetric INT4 math** with
+> `qmax = 7` and the same shift-trick for unpacking signed nibbles.
+> Different: KIVI K is quantized **streaming at decode time** (new
+> tokens arrive and are quantized into the cache on the fly), while
+> W4A16 weights are quantized **once offline** before any inference.
 
 ---
 
@@ -2936,6 +3329,21 @@ potentially 4× faster — fits cleanly.
 >   read 112 MiB at HBM peak (1008 GB/s)?
 > - What about at the *L2* level (72 MiB cache, much higher bandwidth)?
 >   How does that change the analysis?
+>
+> **Answers**
+> - At M=1, the arithmetic intensity is ~1 FLOP/byte (read 2 bytes of
+>   weight, do one fma = 2 FLOPs, output 2 bytes — but reuse is M-fold,
+>   and M=1 gives no reuse). The 4090 needs ~80 FLOP/byte to be
+>   compute-bound (~330 TFLOPS / ~1 TB/s). We're way below that ratio,
+>   so HBM weight traffic gates everything.
+> - `112 MiB / 1008 GB/s ≈ 111 µs`. cuBLAS fp16 measures 134 µs, so
+>   it's ~83% of HBM peak — already memory-bound on HBM.
+> - The MLP up/gate W4A16 weights are 28.88 MiB — fits in 72 MiB L2.
+>   After the first call, weights are L2-resident, and L2 bandwidth
+>   (~5 TB/s effective) lets the same 112 MiB-equivalent of work
+>   complete in ~22 µs. The thesis stays "memory-bound" but the
+>   ceiling moves up — which is exactly why 3c sees 1577 GB/s
+>   "effective bandwidth."
 
 ---
 
@@ -3009,6 +3417,24 @@ The fix from Part 3 we'd reach for: *shorten the per-iter chain* and
 >   thread)?
 > - Why does N affect grid utilization but K doesn't (in 3b)?
 > - What lesson from Phase 1 v4 applies here, and which doesn't?
+>
+> **Answers**
+> - Weight load (`LDG.E.32` of one packed uint32) → unpack 8 nibbles
+>   via shift-trick → 8 sequential FMAs into the same per-thread
+>   accumulator → next iter. The 8 FMAs all serialize on the single
+>   accumulator register.
+> - N determines the block count (`N / BLOCK_N`) because each block
+>   produces one tile of `BLOCK_N` output columns. K is iterated
+>   *inside* each block (the reduction dimension) — 3b doesn't split K
+>   across blocks, so K doesn't add blocks, it just makes each block's
+>   inner loop longer.
+> - **Applies**: "more SMs doesn't help when per-thread chain is the
+>   bottleneck" — for `14336 × 4096`, K=14336 makes the per-thread
+>   chain very long; adding blocks alone wouldn't shorten it.
+>   **Doesn't apply**: v4's "the chain is the ceiling" assumed
+>   grid utilization was fine — for 3b at `4096 × 4096`, the grid is
+>   genuinely under-utilized (128 blocks on 128 SMs), so adding
+>   parallelism *would* help. Different bottleneck mix.
 
 ---
 
@@ -3087,6 +3513,22 @@ The improvement factorises beautifully:
 > - The 3c improvement over 3b is "uniform" across shapes (5.4× /
 >   4.4× / 6.3×). What does that uniformity tell us about the *kind*
 >   of changes 3c made?
+>
+> **Answers**
+> - **128 threads per block, 32 threads per warp, 4 warps per block.**
+>   Each output column receives contributions from 4 warps (each warp
+>   handles K/4 of the reduction), combined via a tiny shmem reduction
+>   at the end.
+> - Even at MLP up/gate (3b's only win), per-thread K = 4096 was still
+>   a long serial chain. K-split-across-warps shortens each thread's
+>   inner loop to K/4 = 1024 iters, so the per-thread chain tightens
+>   regardless of whether the grid was the bottleneck.
+> - It tells us 3c attacked a *shared underlying constraint* — both
+>   per-thread chain length AND grid undersizing — with the same
+>   change (multi-warp K split). Uniform speedup across very different
+>   shapes is the signature of an optimization that addresses a
+>   bottleneck common to all of them, rather than fixing distinct bugs
+>   in each shape.
 
 ---
 
@@ -3148,6 +3590,20 @@ tokens). The warm-cache regime is what serving actually sees.
 > - In a realistic chat-serving workload (e.g., 8 users × 500 tokens
 >   per response × 32 layers), how many times does each weight tensor
 >   get read? Why does this matter for cache analysis?
+>
+> **Answer**
+> - **L2 measurement.** HBM peak is 1008 GB/s; 1577 GB/s exceeds it,
+>   which is only possible if data is served from a faster cache.
+>   28.88 MiB of packed W4A16 weights fits comfortably in the 72 MiB
+>   L2, and the bench's 100 timed iters (after 25 warmups) all run
+>   with weights warm in L2.
+> - Each weight tensor is read once per (decode step × layer × user) —
+>   though across users in a batch, the reads are concurrent and share
+>   the L2 line. For 8 users × 500 tokens × 32 layers, that's ~16,000
+>   reads of each weight tensor per request. The first read is
+>   HBM-bound; the rest are L2-served. So the cumulative cost is
+>   dominated by L2-served reads, not the first HBM miss — making the
+>   warm-cache regime the realistic one to optimize for.
 
 ---
 
