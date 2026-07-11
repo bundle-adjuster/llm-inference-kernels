@@ -31,11 +31,14 @@ void launch_decode_attention(
 // decode_attention_n_splits() to size them.
 int decode_attention_n_splits(int batch, int n_heads, int seqlen_kv);
 
+// kv_buf_len is the allocated stride between KV positions of one (batch, kv_head)
+// — equal to seqlen_kv for a contiguous cache, or the preallocated max length for
+// an in-place (static) cache whose live [0, seqlen_kv) prefix is read directly.
 void launch_decode_attention_splitk(
     const half* q, const half* k, const half* v, half* out,
     float* partial_o, float* partial_m, float* partial_l,
     int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
-    int n_splits, float softmax_scale, cudaStream_t stream);
+    int kv_buf_len, int n_splits, float softmax_scale, cudaStream_t stream);
 
 
 // Variant of the decode kernel reading INT8 K/V with per-token fp16 scales,

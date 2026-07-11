@@ -17,8 +17,14 @@
 // Phase 7) whenever splitting helps; falls back to the v3 single-block kernel
 // when the sequence is too short to split usefully. The old v3 kernel is still
 // reachable directly as `decode_attention_v3` for before/after benchmarking.
+// `seqlen` is the live KV length. Default (-1) treats k/v as a contiguous
+// [batch, n_kv_heads, S, head_dim] cache of length S = k.size(2). Passing a live
+// length < k.size(2) reads the [0, seqlen) prefix of a *preallocated* cache in
+// place (stride = k.size(2)) — this is how the decode path skips the per-step KV
+// `torch.cat`, which SDPA could not do (it fell back to the math backend).
 torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
-                               torch::Tensor v, double softmax_scale) {
+                               torch::Tensor v, double softmax_scale,
+                               int64_t seqlen = -1) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "q, k, v must be CUDA tensors");
     TORCH_CHECK(q.scalar_type() == torch::kHalf, "fp16 only for now");
@@ -26,19 +32,24 @@ torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
                 "inputs must be contiguous");
 
     // q: [batch, n_heads, head_dim]
-    // k/v: [batch, n_kv_heads, seqlen_kv, head_dim]
+    // k/v: [batch, n_kv_heads, kv_buf_len, head_dim]
     const int batch      = q.size(0);
     const int n_heads    = q.size(1);
     const int head_dim   = q.size(2);
     const int n_kv_heads = k.size(1);
-    const int seqlen_kv  = k.size(2);
+    const int kv_buf_len = k.size(2);                 // allocated stride
+    const int seqlen_kv  = (seqlen > 0) ? static_cast<int>(seqlen) : kv_buf_len;
+    TORCH_CHECK(seqlen_kv <= kv_buf_len, "seqlen exceeds allocated cache length");
+    const bool strided   = (seqlen_kv != kv_buf_len);
 
     auto out = torch::empty_like(q);
-
-    const int n_splits = decode_attention_n_splits(batch, n_heads, seqlen_kv);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    if (n_splits <= 1) {
+    int n_splits = decode_attention_n_splits(batch, n_heads, seqlen_kv);
+
+    // v3 assumes a contiguous cache (stride == length); only split-K carries the
+    // separate kv_buf_len. So take the v3 fast path only for a contiguous cache.
+    if (n_splits <= 1 && !strided) {
         launch_decode_attention(
             reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
             reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
@@ -48,6 +59,7 @@ torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
             static_cast<float>(softmax_scale), stream);
         return out;
     }
+    if (n_splits < 1) n_splits = 1;
 
     // Split-K scratch (fp32). torch's caching allocator makes the per-call
     // allocation effectively free after warmup.
@@ -64,7 +76,7 @@ torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
         partial_l.data_ptr<float>(),
         batch, n_heads, n_kv_heads, seqlen_kv, head_dim,
-        n_splits, static_cast<float>(softmax_scale), stream);
+        kv_buf_len, n_splits, static_cast<float>(softmax_scale), stream);
 
     return out;
 }
@@ -363,9 +375,38 @@ torch::Tensor w4a16_gemm(torch::Tensor act,
 }
 
 
+// Materialize the full fp16 weight [K, N] from packed int4 + groupwise scales,
+// in one CUDA pass. For the prefill path (large M), where a dequant + cuBLAS
+// GEMM beats the decode-shaped quantized kernel. weight_packed: [K/8, N] int32.
+torch::Tensor w4a16_dequantize(torch::Tensor weight_packed, torch::Tensor scale,
+                               int64_t group_size) {
+    TORCH_CHECK(weight_packed.is_cuda() && scale.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(weight_packed.scalar_type() == torch::kInt32, "weight_packed int32");
+    TORCH_CHECK(scale.scalar_type() == torch::kHalf, "scale fp16");
+    TORCH_CHECK(weight_packed.is_contiguous() && scale.is_contiguous(), "contiguous");
+
+    const int K = weight_packed.size(0) * 8;
+    const int N = weight_packed.size(1);
+    TORCH_CHECK(scale.size(1) == N, "scale/weight N mismatch");
+    TORCH_CHECK(group_size > 0 && K % static_cast<int>(group_size) == 0,
+                "K must be a multiple of group_size");
+
+    auto out = torch::empty({K, N}, scale.options());
+    launch_w4a16_dequantize(
+        reinterpret_cast<const uint32_t*>(weight_packed.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scale.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        K, N, static_cast<int>(group_size),
+        at::cuda::getCurrentCUDAStream());
+    return out;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_attention", &decode_attention,
-          "Fused decode attention (fp16 KV; v6 FlashDecoding split-K, v3 fallback)");
+          "Fused decode attention (fp16 KV; v6 FlashDecoding split-K, v3 fallback)",
+          pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("softmax_scale"), pybind11::arg("seqlen") = -1);
     m.def("decode_attention_v3", &decode_attention_v3,
           "Phase 1 v3 decode attention (single-warp block); pre-Phase-7 baseline");
     m.def("quantize_per_token", &quantize_per_token,
@@ -382,4 +423,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused decode attention reading KIVI INT4 KV with fused dequant");
     m.def("w4a16_gemm", &w4a16_gemm,
           "W4A16 quantized matmul: fp16 act @ INT4 packed weight (decode-shape kernel)");
+    m.def("w4a16_dequantize", &w4a16_dequantize,
+          "Materialize fp16 weight [K,N] from packed int4 + groupwise scales (prefill path)");
 }

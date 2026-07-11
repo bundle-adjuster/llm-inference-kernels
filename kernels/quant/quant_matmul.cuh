@@ -42,3 +42,11 @@ void launch_w4a16_gemm_splitk(
     const half* act, const uint32_t* weight_packed, const half* scales,
     float* acc, half* out, int M, int N, int K, int group_size,
     int n_splits, cudaStream_t stream);
+
+
+// Materialize the full fp16 weight [K, N] from packed int4 + groupwise scales in
+// one pass — for the prefill path, where cuBLAS on the dequantized weight beats
+// any decode-shaped quantized kernel at large M.
+void launch_w4a16_dequantize(
+    const uint32_t* weight_packed, const half* scales, half* out,
+    int K, int N, int group_size, cudaStream_t stream);

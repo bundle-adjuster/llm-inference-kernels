@@ -79,7 +79,7 @@ __global__ void decode_attention_splitk_partial_kernel(
     float* __restrict__ partial_m,   // [batch, n_heads, n_splits]
     float* __restrict__ partial_l,   // [batch, n_heads, n_splits]
     int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
-    int n_splits, float softmax_scale) {
+    int kv_buf_len, int n_splits, float softmax_scale) {
 
     const int batch_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -106,9 +106,13 @@ __global__ void decode_attention_splitk_partial_kernel(
         return;
     }
 
+    // Address with kv_buf_len (the allocated stride) but iterate over seqlen_kv
+    // (the live length). For a contiguous cache the two are equal; for a
+    // preallocated [batch, n_kv, kv_buf_len, head_dim] cache they differ, letting
+    // us read the live [0, seqlen_kv) prefix in place — no per-step copy.
     const half* q_ptr  = q + (batch_idx * n_heads    + head_idx)    * head_dim + lane * VEC;
-    const half* k_base = k + (batch_idx * n_kv_heads + kv_head_idx) * seqlen_kv * head_dim;
-    const half* v_base = v + (batch_idx * n_kv_heads + kv_head_idx) * seqlen_kv * head_dim;
+    const half* k_base = k + (batch_idx * n_kv_heads + kv_head_idx) * kv_buf_len * head_dim;
+    const half* v_base = v + (batch_idx * n_kv_heads + kv_head_idx) * kv_buf_len * head_dim;
 
     const float4 q_v = load_half4_as_float4(q_ptr);
 
@@ -230,12 +234,12 @@ void launch_decode_attention_splitk(
     const half* q, const half* k, const half* v, half* out,
     float* partial_o, float* partial_m, float* partial_l,
     int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
-    int n_splits, float softmax_scale, cudaStream_t stream) {
+    int kv_buf_len, int n_splits, float softmax_scale, cudaStream_t stream) {
 
     dim3 grid_partial(batch, n_heads, n_splits);
     decode_attention_splitk_partial_kernel<<<grid_partial, NWARPS * 32, 0, stream>>>(
         q, k, v, partial_o, partial_m, partial_l,
-        batch, n_heads, n_kv_heads, seqlen_kv, head_dim, n_splits, softmax_scale);
+        batch, n_heads, n_kv_heads, seqlen_kv, head_dim, kv_buf_len, n_splits, softmax_scale);
     CUDA_CHECK_LAST();
 
     dim3 grid_combine(batch, n_heads);

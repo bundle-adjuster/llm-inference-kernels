@@ -603,6 +603,40 @@ __global__ void w4a16_acc_to_out_kernel(const float* __restrict__ acc,
     if (i < total) out[i] = __float2half(acc[i]);
 }
 
+// Full-weight dequant: [K/PACK, N] int4 packed + [n_groups, N] scales -> [K, N]
+// fp16, in ONE pass. Used for the prefill path (large M), where cuBLAS on a
+// materialized fp16 weight beats any M-serial quantized kernel — the only cost
+// is producing the fp16 weight, and the PyTorch version did that in ~6 passes
+// with per-matrix allocation. One thread owns a (k_pack, n) column word and
+// writes its PACK=8 fp16 outputs; writes are coalesced across n.
+__global__ void w4a16_dequantize_kernel(
+    const uint32_t* __restrict__ weight_packed, const half* __restrict__ scales,
+    half* __restrict__ out, int K, int N, int group_size) {
+    const int n      = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k_pack = blockIdx.y;
+    if (n >= N) return;
+    const uint32_t packed = weight_packed[k_pack * N + n];
+    const int k0 = k_pack * PACK;
+    #pragma unroll
+    for (int i = 0; i < PACK; ++i) {
+        const int k       = k0 + i;
+        const int nibble  = (static_cast<int32_t>(packed) << (28 - i * 4)) >> 28;
+        const float scale = __half2float(scales[(k / group_size) * N + n]);
+        out[k * N + n] = __float2half(static_cast<float>(nibble) * scale);
+    }
+}
+
+void launch_w4a16_dequantize(
+    const uint32_t* weight_packed, const half* scales, half* out,
+    int K, int N, int group_size, cudaStream_t stream) {
+    const int threads = 256;
+    dim3 block(threads);
+    dim3 grid((N + threads - 1) / threads, K / PACK);
+    w4a16_dequantize_kernel<<<grid, block, 0, stream>>>(
+        weight_packed, scales, out, K, N, group_size);
+    CUDA_CHECK_LAST();
+}
+
 // Pick n_splits so the grid (ceil(N/TC_BLOCK_N) × n_splits) fills the SMs a few
 // waves deep, bounded by the number of K-groups available to split.
 int w4a16_n_splits(int M, int N, int K, int group_size) {
