@@ -536,21 +536,28 @@ __global__ void w4a16_gemm_tc_splitk_kernel(
                 : __float2half(0.0f);
         }
 
-        const int tile_elems = group_size * TC_BLOCK_N_PER_WARP;
-        for (int idx = lane; idx < tile_elems; idx += 32) {
-            const int k             = idx / TC_BLOCK_N_PER_WARP;
-            const int n_col_in_warp = idx % TC_BLOCK_N_PER_WARP;
+        // Dequant the [group_size, BLOCK_N_PER_WARP] weight tile. Each lane owns
+        // (k_pack, col) pairs and reads each packed uint32 exactly ONCE, then
+        // unpacks all PACK=8 K-positions from it — vs the naive one-read-per-
+        // nibble, which re-read every word 8× and left the kernel L2/issue-bound
+        // at ~28% of peak HBM.
+        const int packs_per_group = group_size / PACK;                 // 16
+        const int n_pairs         = packs_per_group * TC_BLOCK_N_PER_WARP;
+        const int k_pack_base     = k_start / PACK;
+        for (int pidx = lane; pidx < n_pairs; pidx += 32) {
+            const int kp            = pidx / TC_BLOCK_N_PER_WARP;      // k_pack in group
+            const int n_col_in_warp = pidx % TC_BLOCK_N_PER_WARP;
             const int n_col         = warp_n_start + n_col_in_warp;
             const bool valid        = (n_col < N);
 
-            const int      k_pack    = (k_start + k) / PACK;
-            const int      k_in_pack = k % PACK;
-            const uint32_t packed    = valid ? weight_packed[k_pack * N + n_col] : 0u;
-            const int      nibble    = (static_cast<int32_t>(packed)
-                                        << (28 - k_in_pack * 4)) >> 28;
-            const float    scale_v   = valid ? __half2float(scales[g * N + n_col]) : 0.0f;
-            my_weight_smem[k * TC_BLOCK_N_PER_WARP + n_col_in_warp] =
-                __float2half(static_cast<float>(nibble) * scale_v);
+            const uint32_t packed  = valid ? weight_packed[(k_pack_base + kp) * N + n_col] : 0u;
+            const float    scale_v = valid ? __half2float(scales[g * N + n_col]) : 0.0f;
+            #pragma unroll
+            for (int i = 0; i < PACK; ++i) {
+                const int nibble = (static_cast<int32_t>(packed) << (28 - i * 4)) >> 28;
+                my_weight_smem[(kp * PACK + i) * TC_BLOCK_N_PER_WARP + n_col_in_warp] =
+                    __float2half(static_cast<float>(nibble) * scale_v);
+            }
         }
         __syncthreads();
 
