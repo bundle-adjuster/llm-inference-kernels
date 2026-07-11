@@ -107,3 +107,38 @@ def v6_decode(cache: PreallocCache):
         _ml.repeat_kv = orig_repeat
         F.scaled_dot_product_attention = _ORIGINAL_SDPA
         torch.nn.functional.scaled_dot_product_attention = _ORIGINAL_SDPA
+
+
+@contextlib.contextmanager
+def fused_decode(cache: PreallocCache):
+    """`v6_decode` plus fused RMSNorm and SwiGLU (Phase 10).
+
+    transformers runs RMSNorm as ~5 kernels (pow/mean/rsqrt/mul/mul) and SwiGLU
+    as two (silu, then mul); replacing each with one fused kernel is what a
+    serving engine does. This is what closes the last fp16-vs-fp16 gap to vLLM
+    (the projection GEMMs already go through cuBLAS, same as vLLM). Both fused
+    ops match the reference within fp16 rounding; greedy output is preserved.
+    """
+    orig_rms = _ml.LlamaRMSNorm.forward
+    orig_mlp = _ml.LlamaMLP.forward
+    orig_rope = _ml.apply_rotary_pos_emb
+
+    def rms_fwd(self, hidden_states):
+        return llmik_cuda.rmsnorm(hidden_states, self.weight, self.variance_epsilon)
+
+    def mlp_fwd(self, x):
+        return self.down_proj(llmik_cuda.silu_mul(self.gate_proj(x), self.up_proj(x)))
+
+    def rope_fwd(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        return llmik_cuda.rope(q, cos, sin), llmik_cuda.rope(k, cos, sin)
+
+    _ml.LlamaRMSNorm.forward = rms_fwd
+    _ml.LlamaMLP.forward = mlp_fwd
+    _ml.apply_rotary_pos_emb = rope_fwd
+    try:
+        with v6_decode(cache):
+            yield
+    finally:
+        _ml.LlamaRMSNorm.forward = orig_rms
+        _ml.LlamaMLP.forward = orig_mlp
+        _ml.apply_rotary_pos_emb = orig_rope

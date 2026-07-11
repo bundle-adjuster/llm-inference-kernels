@@ -7,6 +7,7 @@
 #include "attention/fused_attention.cuh"
 #include "kv_cache/kv_compress.cuh"
 #include "quant/quant_matmul.cuh"
+#include "fused/fused_ops.cuh"
 
 
 // Fused decode attention with fp16 KV.
@@ -402,6 +403,76 @@ torch::Tensor w4a16_dequantize(torch::Tensor weight_packed, torch::Tensor scale,
 }
 
 
+// Fused RMSNorm (Phase 10). x: [..., H] fp16; weight: [H] fp16. Returns same
+// shape as x. eps matches the model's rms_norm_eps.
+torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor weight, double eps) {
+    TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && weight.scalar_type() == torch::kHalf,
+                "fp16 only");
+    const int H = x.size(-1);
+    TORCH_CHECK(weight.numel() == H, "weight length must match x last dim");
+    auto xc = x.contiguous();
+    auto x2 = xc.reshape({-1, H});
+    const int M = x2.size(0);
+    auto out = torch::empty_like(x2);
+    launch_rmsnorm(
+        reinterpret_cast<const half*>(x2.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(weight.contiguous().data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        M, H, static_cast<float>(eps), at::cuda::getCurrentCUDAStream());
+    return out.reshape(x.sizes());
+}
+
+// Fused SwiGLU (Phase 10): silu(gate) * up, elementwise. Same shape in/out.
+torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up) {
+    TORCH_CHECK(gate.is_cuda() && up.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(gate.scalar_type() == torch::kHalf && up.scalar_type() == torch::kHalf,
+                "fp16 only");
+    TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have the same shape");
+    auto g = gate.contiguous();
+    auto u = up.contiguous();
+    auto out = torch::empty_like(g);
+    launch_silu_mul(
+        reinterpret_cast<const half*>(g.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(u.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        static_cast<int>(g.numel()), at::cuda::getCurrentCUDAStream());
+    return out;
+}
+
+
+// Fused RoPE (Phase 10). x: [B, H, S, D] fp16; cos/sin: [B, S, D] fp16.
+// Returns x rotated: x*cos + rotate_half(x)*sin.
+torch::Tensor rope(torch::Tensor x, torch::Tensor cos, torch::Tensor sin) {
+    TORCH_CHECK(x.is_cuda() && cos.is_cuda() && sin.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "fp16 only");
+    TORCH_CHECK(x.dim() == 4, "x must be [B, H, S, D]");
+    const int B = x.size(0), H = x.size(1), S = x.size(2), D = x.size(3);
+    TORCH_CHECK(D % 2 == 0, "head_dim must be even");
+    auto xc = x.contiguous();
+    // cos/sin arrive as [B, S, D] or broadcastable [S, D] / [1, S, D]. Normalize
+    // to a contiguous [B, S, D] (the broadcast copy is tiny).
+    auto norm_cs = [&](torch::Tensor t) {
+        t = t.contiguous();
+        const long need = static_cast<long>(B) * S * D;
+        if (t.numel() == need) return t.reshape({B, S, D});
+        TORCH_CHECK(t.numel() == static_cast<long>(S) * D,
+                    "cos/sin must be [B,S,D] or broadcastable [S,D]/[1,S,D]");
+        return t.reshape({1, S, D}).expand({B, S, D}).contiguous();
+    };
+    auto cc = norm_cs(cos);
+    auto sc = norm_cs(sin);
+    auto out = torch::empty_like(xc);
+    launch_rope(
+        reinterpret_cast<const half*>(xc.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(cc.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(sc.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        B, H, S, D, at::cuda::getCurrentCUDAStream());
+    return out;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_attention", &decode_attention,
           "Fused decode attention (fp16 KV; v6 FlashDecoding split-K, v3 fallback)",
@@ -425,4 +496,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "W4A16 quantized matmul: fp16 act @ INT4 packed weight (decode-shape kernel)");
     m.def("w4a16_dequantize", &w4a16_dequantize,
           "Materialize fp16 weight [K,N] from packed int4 + groupwise scales (prefill path)");
+    m.def("rmsnorm", &rmsnorm, "Fused RMSNorm over the last dim (fp16)");
+    m.def("silu_mul", &silu_mul, "Fused SwiGLU: silu(gate) * up (fp16)");
+    m.def("rope", &rope, "Fused RoPE: x*cos + rotate_half(x)*sin (fp16)");
 }
