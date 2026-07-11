@@ -54,8 +54,8 @@ Phase 3 W4A16 GEMM findings are in
 
 | Kernel | Workload | Baseline | This repo | Speedup / saving | Notes |
 |--------|----------|----------|-----------|------------------|-------|
-| **Fused attention (decode)** | Llama 3 8B heads (`n_heads=32, n_kv_heads=8, head_dim=128`), `batch=8, seqlen_kv=4096`, fp16 | PyTorch SDPA 1.36 ms (dispatches to FlashAttention / cuDNN) | **v3: 0.713 ms, 189 GB/s achieved KV BW** | **1.91× over SDPA · 5.28× over PyTorch eager · 2.34× over our v0 baseline** | Phase 1 done; max abs diff vs fp32 reference = 3.1e-5 |
-| Phase 0 end-to-end (Llama 3.1 8B Instruct, batch 16, prompt 512 / gen 512) | greedy decode, EOS suppressed | HF `generate()` 23.10 s · vLLM 0.6.6 11.65 s | n/a (vendor-baseline phase) | vLLM 1.98× HF `generate()` | Phase 0 baselines, `bench_e2e.py` |
+| **Fused attention (decode)** | Llama 3 8B heads (`n_heads=32, n_kv_heads=8, head_dim=128`), `batch=8, seqlen_kv=4096`, fp16 | PyTorch SDPA, GQA-native: **157.3 µs** (flash split-KV, ~81% peak HBM) | **v6 split-K: 155.6 µs** (~82% peak HBM) | **4.59× over our v3** · **1.01× vs SDPA (parity)** | ✅ Phase 8 fix. Phase 7 caught that v3 (the old "1.91× over SDPA") had been timed against a 4×-expanded KV cache and actually *lost* to fair SDPA by 4.55× — it was occupancy-bound, not bandwidth-bound. v6 restores occupancy (FlashDecoding split-K, multi-warp blocks) and reaches **parity with fair SDPA** (1.01–1.02× on HBM-bound shapes — a 1–2% margin, i.e. the noise floor on unlocked clocks; the robust win is 4.59× over v3 and 82% vs 18% of peak HBM). Correct within 2.4e-4 of GQA-native SDPA. See [`docs/06-attention-splitk-journey.md`](docs/06-attention-splitk-journey.md) · [`05`](docs/05-baseline-correction-journey.md) |
+| Phase 0 end-to-end (Llama 3.1 8B Instruct, batch 16, prompt 512 / gen 512) | greedy decode, EOS suppressed | HF `generate()` 23.10 s · vLLM 0.6.6 11.65 s | n/a (vendor-baseline phase) | vLLM 1.98× HF `generate()` | ⚠ Phase 7: that 1.98× is transformers' `repeat_kv`, not kernels. One line (`enable_gqa=True`) takes HF to 533 tok/s / 1.55×, cutting vLLM's lead to 1.31×. Phase 8's v6 kernel edges that fair baseline (538.6 tok/s). The residual vLLM gap is framework tax (`cat` + unfused elementwise), not kernels — the lever is W4A16. Both engines' GEMMs stream the same 15.01 GB/step |
 | **KV cache, INT8 per-token** + fused dequant | same as fused attention row | fp16 KV: 128 MiB / 0.71 ms | INT8 KV: **65 MiB / 0.71 ms** | **0.51× memory** (63 MiB saved) · latency tied with v3 · Δppl **+0.0008** on WikiText-2 | Phase 2b done; essentially lossless drop-in replacement (Δppl well under 0.2 threshold) |
 | **KV cache, INT4 KIVI** (per-channel K, per-token V) + fused dequant | same | fp16 KV: 128 MiB / 0.71 ms | INT4 KV: **34.5 MiB / 0.554 ms** | **0.27× memory** (93 MiB saved) · **1.29× latency** over v3 · Δppl **+0.196** on WikiText-2 | Phase 2c/2d done; clears the < 0.5 Δppl target. KIVI's per-channel K is 2.36× better than naive per-token K at the same INT4 (0.196 vs 0.462) — direct confirmation that K's persistent outliers need their own scales |
 | **Quantized matmul (W4A16)** — attn QKV/O (K=4096, N=4096, M=1) | fp16 W: 32 MiB | fp16 cuBLAS 0.047 ms | INT4 W: **8.25 MiB / 0.016 ms** | **0.26× memory** · **2.88× latency** | Phase 3c; symmetric INT4 per-channel groupwise (group=128) |
@@ -114,13 +114,24 @@ See [`TODO.md`](TODO.md) for the phased, step-by-step plan.
 at fp16, vLLM + HF `generate()` baselines captured in
 [`docs/results/RESULTS.md`](docs/results/RESULTS.md).
 
-**Phase 1 — fused decode attention: substantially complete.** Six kernel
-versions explored (v0 → v5); **v3 lives on `main` at 0.713 ms / 189 GB/s, 1.91×
-faster than PyTorch SDPA** on the reference microbench workload. v4
-(FlashDecoding split-K) and v5 (`cp.async` double-buffering) were explored
-but regressed on this workload — both retained in git history with diagnostic
-writeups in
-[`docs/01-fused-attention-journey.md`](docs/01-fused-attention-journey.md).
+**Phase 1 — fused decode attention: reopened by Phase 7, fixed in Phase 8.**
+Six kernel versions explored (v0 → v5); v3 reached 2.34× over our v0 but the
+"1.91× faster than PyTorch SDPA" headline was measured against SDPA handed a
+4×-expanded GQA cache. Against SDPA's native GQA path, v3 is **4.55× slower** —
+occupancy-bound (a single-warp block that fills ~2 of the 128 SMs), not
+bandwidth-bound (Phase 7,
+[`docs/05`](docs/05-baseline-correction-journey.md)). **Phase 8 implemented the
+fix Phase 7 identified:** v6 is FlashDecoding split-K on multi-warp blocks, and
+now runs at **155.6 µs vs fair SDPA's 157.3 µs — a 4.59× speedup over v3**, at
+~82% of peak HBM. The custom kernel reaches **parity with PyTorch SDPA** on the
+reference workload (1.01×, a 1–2% margin) and edges the fair baseline end-to-end
+(538.6 vs 533.1 tok/s), where v3 lost.
+Full story: [`docs/06-attention-splitk-journey.md`](docs/06-attention-splitk-journey.md).
+v3 is preserved as `decode_attention_v3`; v4/v5 remain in git history with
+diagnostic writeups in
+[`docs/01-fused-attention-journey.md`](docs/01-fused-attention-journey.md)
+(the v4 split-K revert's bandwidth-ceiling diagnosis was wrong — v6 proves it by
+fixing occupancy and beating flash).
 Remaining: direct comparison vs raw `flash_attn` (currently we have it
 indirectly via SDPA), `ncu` profile with locked clocks for the "Cause"
 column in RESULTS.md, stretch goals (tensor-core MMA path, prefill FA-2

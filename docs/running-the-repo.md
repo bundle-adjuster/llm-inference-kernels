@@ -55,13 +55,16 @@ first use. The download is ~16 GB.
 # Should print "42 passed"
 pytest tests/
 
-# Should print "decode attention ... 0.71 ms ... 189 GB/s"
+# Should print "decode attention ... ~0.16 ms ... ~82% of peak HBM"
+# (v6 split-K, Phase 8; the retired v3 kernel printed 0.71 ms / 189 GB/s)
 python benchmarks/bench_attention.py
 ```
 
 If both work, the extension is built correctly and `main` is in the
-v3 + INT4 KIVI + W4A16 + Phase 6 tensor-core state (every kernel landed
-through Phase 6 is on the dispatch path).
+v6 split-K attention + INT4 KIVI + W4A16 + Phase 6 tensor-core state
+(every kernel landed through Phase 8 is on the dispatch path;
+`decode_attention` dispatches to the v6 FlashDecoding split-K kernel,
+with the old kernel preserved as `decode_attention_v3`).
 
 ---
 
@@ -105,8 +108,10 @@ python benchmarks/bench_attention.py  # bench the current kernel
 pytest tests/test_attention.py        # confirm correctness
 ```
 
-`main` is currently the v3 + INT4 KIVI state. After exploring a branch,
-return with `git checkout main && python setup.py build_ext --inplace`.
+`main` is currently the v6 split-K attention + INT4 KIVI state
+(`decode_attention` → v6; v3 preserved as `decode_attention_v3`). After
+exploring a branch, return with
+`git checkout main && python setup.py build_ext --inplace`.
 
 ### What to expect, per branch
 
@@ -121,12 +126,26 @@ after 25 warmup).
 | `v1-naive`   | `46ae1ea`  | 2.078 ms | 65 GB/s  | 0.80×  | Online softmax — **regression** (V load not prefetched) |
 | `v1`         | `ad9c57f`  | 1.637 ms | 82 GB/s  | 1.02×  | Same + explicit V prefetch                          |
 | `v2`         | `db6ab0b`  | 1.069 ms | 126 GB/s | 1.56×  | Single-sync block reduce (double-buffered shmem)    |
-| **`v3`**     | `ccdb6df`  | **0.713 ms** | **189 GB/s** | **2.34×** | Vectorized 64-bit KV loads, single-warp block — **on `main`** |
+| **`v3`**     | `ccdb6df`  | **0.713 ms** | **189 GB/s** | **2.34×** | Vectorized 64-bit KV loads, single-warp block — retired on `main`, superseded by v6 split-K (Phase 8, see [06](06-attention-splitk-journey.md)) |
 | `v4`         | `f904aae`  | 0.802 ms | 167 GB/s | 2.08×  | Split-K (FlashDecoding) — **regressed, reverted**   |
 | `v5`         | `78a28ff`  | 0.760 ms | 177 GB/s | 2.20×  | `cp.async` double-buffer — **regressed, reverted**  |
 
-PyTorch SDPA (FA / cuDNN) lands at **1.36 ms** on this workload. So `v3`
-beats the official FlashAttention dispatch by **1.91×**.
+Against a **GQA-native** SDPA baseline
+(`F.scaled_dot_product_attention(..., enable_gqa=True)`, **157.3 µs** on
+this workload) the single-warp `v3` above actually **loses**: 713.7 µs
+vs 157.3 µs — 4.55× slower (**0.22×**). `v3` is occupancy-bound (its
+single-warp block fills ~2 of 128 SMs, ~18% of peak HBM), *not*
+bandwidth-bound, so the retired "1.36 ms SDPA → 1.91× over
+FlashAttention" headline was an artefact of a **handicapped baseline**
+(SDPA fed a 4×-expanded GQA KV cache). **Phase 8's `v6`** — FlashDecoding
+split-K on 4-warp blocks — is what finally beats fair SDPA: **155.6 µs,
+1.01×** (and 4.59× over `v3`), at ~82% of peak HBM. On `main`,
+`decode_attention` now dispatches to v6; the old kernel is preserved as
+`decode_attention_v3`. See
+[`06-attention-splitk-journey.md`](06-attention-splitk-journey.md) (the
+fix) and
+[`05-baseline-correction-journey.md`](05-baseline-correction-journey.md)
+(the correction).
 
 ### What to look for, per branch
 
@@ -165,17 +184,24 @@ trade per-SM occupancy (full → 33%) for vec-load throughput + zero
 syncs. It paid off — 1.50× over v2 — because the lost warps were idle
 at barriers anyway. **Occupancy is a means, not an end.**
 
-**`v4` / `v5`** — both *regressed*. Read these for the bandwidth-bound
-vs dependency-chain-bound diagnosis:
-- `v4` adds more SMs via split-K. Doesn't help — the bottleneck wasn't
-  grid utilization.
+**`v4` / `v5`** — both *regressed at the time* on the single-warp `v3`
+base. Read these as history — but note the **original v4 diagnosis was
+wrong**:
+- `v4` added more SMs via split-K and regressed, so we concluded "the
+  bottleneck wasn't grid utilization / bandwidth was the ceiling."
+  **Phase 8 overturned this.** `v3` was occupancy-bound (single-warp
+  block, ~18% of peak HBM, ~2 of 128 SMs), and split-K rebuilt on
+  **4-warp blocks** — the Phase 8 `v6` kernel — is exactly what fixed
+  it: v6 reaches ~82% of peak HBM and beats fair SDPA. Grid/occupancy
+  *was* the ceiling; split-K done right is the win. See
+  [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 - `v5` adds explicit `cp.async` pipelining. Doesn't help — the shmem
   hop cost more than the explicit pipeline saved, and nvcc was already
-  pipelining loads implicitly.
+  pipelining loads implicitly. (This diagnosis still stands.)
 
-The diagnostic value here: when bandwidth isn't the ceiling, bandwidth-
-targeting optimizations don't help. Phase 2 will hit this lesson again
-in 2b.
+The dependency-chain-bound vs bandwidth-bound framing still carries into
+Phase 2's 2b; only the v4 "bandwidth was the ceiling" conclusion was
+retired.
 
 ### Phase 1 microbenchmark
 
@@ -184,8 +210,12 @@ in 2b.
 python benchmarks/bench_attention.py
 ```
 
-Looks for: PyTorch eager (~3.77 ms), SDPA (~1.36 ms), and the
-currently-built custom kernel (whatever branch you're on).
+Looks for: PyTorch eager (~3.77 ms), SDPA, and the currently-built
+custom kernel (whatever branch you're on). The SDPA figure this script
+prints (~1.36 ms) is the **handicapped 4×-expanded-GQA** baseline
+retired in Phase 7 — fair GQA-native SDPA on this workload is ~157 µs
+(measured by `benchmarks/bench_decode_step.py`), which Phase 8's v6
+kernel matches/beats (1.01×).
 
 ---
 
@@ -445,9 +475,15 @@ The interesting design choices:
   + `greedy_match=1.0` confirms decode is bit-perfect across 640 tokens.
 
 The +2.5% tok/s is the *interesting* result: attention is only ~4% of
-decode time at this workload (batch=16, avg kv_len≈768). The microbench
-saw 1.91× faster, but Amdahl says the e2e win is the kernel-speedup ×
-fraction-of-time-on-that-kernel.
+decode time at this workload (batch=16, avg kv_len≈768). This step ran
+the `v3` kernel, whose "1.91× microbench" was against a handicapped
+(4×-expanded GQA) SDPA baseline — against fair GQA-native SDPA `v3`
+actually *lost* (0.22×), so there was never an attention win to amortize
+here. Amdahl still sets the ceiling: the e2e win is kernel-speedup ×
+fraction-of-time-on-that-kernel, and the kernel that actually clears
+1.0× on fair SDPA is **Phase 8's v6** (now the dispatched
+`decode_attention`). See
+[`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 **`phase4-kv-int4`** — read `integration/kv_int4_cache.py` (the HF Cache
 subclass) + the `patched_int4_decode_attention` context in

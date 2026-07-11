@@ -48,8 +48,17 @@ def main() -> None:
                     name="pytorch eager (decode)"))
 
     # --- baseline: PyTorch SDPA (FlashAttention / cuDNN) ---
+    # NOTE: `sdpa_attention` first calls `_expand_gqa`, so SDPA runs on a
+    # 4x-expanded KV cache. That is the HANDICAPPED baseline (Phase 7): the
+    # old v3 kernel only looked "1.91x faster than SDPA" because SDPA was
+    # forced to read 4x the KV bytes. Against GQA-native SDPA
+    # (F.scaled_dot_product_attention(..., enable_gqa=True)) v3 actually LOST
+    # (0.22x). The v6 split-K kernel is what finally beats fair SDPA (1.01x).
+    # For the fair GQA-native comparison, run benchmarks/bench_decode_step.py.
+    # See docs/05-baseline-correction-journey.md and
+    # docs/06-attention-splitk-journey.md.
     print(benchmark(lambda: sdpa_attention(q.unsqueeze(2), k, v),
-                    name="pytorch sdpa (decode)"))
+                    name="pytorch sdpa (decode, GQA-EXPANDED / handicapped)"))
 
     # --- custom kernel (v0) ---
     import llmik_cuda

@@ -1,7 +1,9 @@
 """Benchmark: INT8 KV-cache vs fp16 KV (decode attention).
 
 Measures:
-  - PyTorch SDPA on fp16 KV  (production baseline)
+  - PyTorch SDPA on fp16 KV  (GQA-*expanded* handicapped path, NOT a fair
+    baseline — see sdpa_attention docstring; the fair GQA-native SDPA and the
+    v6 split-K kernel that matches it are in docs/06-attention-splitk-journey.md)
   - v3 fp16 attention        (Phase 1 main)
   - INT8 attention + fused dequant
   - Quantize kernel one-shot cost

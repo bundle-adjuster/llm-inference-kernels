@@ -118,10 +118,16 @@ Key lessons from this phase (each tied to a sub-step in the journey doc):
    W4A16 win on Llama linear layers is the same pattern as Phase 1
    attention's "find the workload where bandwidth is the ceiling and
    exploit smaller bytes."
-2. **K-split across warps works where attention's didn't.** Phase 1
-   v4's split-K lost because attention's per-iter dependency chain
-   was the actual ceiling. GEMM's K-loop has no such chain — K-split
-   converts purely.
+2. **K-split across warps pays once the block is multi-warp.** Phase 1
+   v4's split-K was blamed on attention's per-iter dependency chain /
+   "bandwidth was the ceiling" — that diagnosis was wrong (Phase 7). The
+   real problem was occupancy: v4's split-K sat on a **single-warp** block
+   that filled ~2 of 128 SMs. Phase 8's v6 puts the same split-K on
+   **multi-warp** blocks (4 warps) and it converts cleanly — beats fair
+   GQA-native SDPA (1.01×, ~82% of peak HBM, 4.59× over v3). 3c's GEMM
+   K-split worked immediately for the same reason: it was already
+   multi-warp, so it never hit the occupancy wall attention did. See
+   [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 3. **Multi-warp blocks pay when there's K-side compute to split.**
    3c's K-split + 3b's M-loop are the same "move work out of the
    inner serial loop" idea applied to different axes.

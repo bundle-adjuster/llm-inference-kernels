@@ -23,6 +23,19 @@
   this workload, 1.91× faster than PyTorch SDPA). Phase 2's job is to
   keep that latency or beat it, and slash KV-cache memory.
 
+> **⚠ Phase 7 / ✅ Phase 8:** The "1.91× faster than PyTorch SDPA" framing
+> is **retired**. That baseline fed SDPA a 4×-expanded GQA KV cache; against
+> GQA-native SDPA (`F.scaled_dot_product_attention(..., enable_gqa=True)`)
+> the v3 kernel is actually **4.55× slower** (0.22× on its reference
+> workload), because v3's single-warp block is **occupancy-bound**
+> (~2 of 128 SMs), not bandwidth-bound. The v6 FlashDecoding split-K kernel
+> (multi-warp blocks) is what finally beats fair SDPA — 155.6 µs vs SDPA's
+> 157.3 µs (1.01×) at batch=8/kv=4096, 4.59× over v3, ~82% of peak HBM.
+> See [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md)
+> (the correction) and [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md)
+> (the fix). **The INT8/INT4 latency comparisons below are all vs OUR v3 and
+> remain valid** — only the vs-SDPA framing changes.
+
 Phase 2's primary metric is **memory**: a chat-serving KV cache at 8K
 context × batch 32 is ~64 GB in fp16, so KV-cache is what caps both
 concurrent users and context length. The decode kernel also reads the
@@ -140,6 +153,16 @@ softmax (fmaxf + 2 expf) → FMA`. That shape doesn't change between
 fp16 and int8 — and *that's* what limits throughput on this workload.
 This was directly consistent with Phase 1's v4 (split-K) and v5
 (`cp.async`) results: both attacked bandwidth, neither helped.
+
+> **⚠ Phase 7 / ✅ Phase 8:** "Dependency-chain-bound, not bandwidth-bound"
+> was itself incomplete. The real ceiling on v3 was **occupancy** — its
+> single-warp block fills only ~2 of 128 SMs. Phase 1's v4 (split-K) failed
+> because it kept v3's single-warp block; the fix was *both* split-K *and*
+> multi-warp blocks (4 warps/block), delivered by v6 in Phase 8. v6 reaches
+> ~82% of peak HBM and runs 4.59× faster than v3, beating fair GQA-native
+> SDPA. The INT8-tied-with-v3 result here is a real CUDA-vs-v3 measurement
+> and still holds; only the "this is the hard ceiling" reading is retired.
+> See [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 So we updated the framing: **Phase 2b's win is memory, not latency.**
 0.51× KV memory means ~2× longer context or ~2× larger batch in the
@@ -368,6 +391,15 @@ table — no extra bits per value.
    was at ~9–19% of peak. The dependency chain was the ceiling. Always
    verify which ceiling you're actually hitting before optimising
    against it (the same lesson Phase 1's v4 and v5 taught).
+
+   > **⚠ Phase 7 / ✅ Phase 8:** The "dependency chain was the ceiling"
+   > verdict was wrong about the *root cause*. Phase 8 found v3 was
+   > **occupancy-bound** — one warp per block fills ~2 of 128 SMs, so the
+   > kernel sat at ~18% of peak HBM regardless of the per-iter chain. The
+   > v6 split-K kernel on multi-warp blocks hits ~82% of peak and runs
+   > 4.59× faster than v3, which also flips the vs-SDPA verdict (v3 lost
+   > 4.55×; v6 wins 1.01×). The INT8/INT4-vs-v3 comparisons in this doc are
+   > unaffected. See [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 2. **Scale loop nesting, not just bit depth, decides whether
    quantization speeds the kernel up.** INT8 per-token loaded a scale

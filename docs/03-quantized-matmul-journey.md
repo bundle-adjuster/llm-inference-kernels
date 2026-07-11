@@ -275,6 +275,19 @@ trade-off.
    When bandwidth isn't the ceiling (Phase 1 v4/v5, Phase 2b), the
    gains evaporate.
 
+   > **⚠ Phase 7 / ✅ Phase 8:** The "Phase 1 v3 attention was bandwidth-
+   > bound at ~19% of HBM peak" premise is wrong *for attention*. v3's
+   > single-warp block was **occupancy-bound** (it filled ~2 of 128 SMs),
+   > not bandwidth-bound, and against a fair GQA-native SDPA baseline v3
+   > actually *lost* (0.22×). This W4A16 GEMM lesson still holds — the
+   > decode GEMM genuinely was bandwidth-bound — but the attention read-
+   > across is retired. Phase 8's v6 split-K on multi-warp blocks hit
+   > ~82% of peak HBM (v3 was 18%) and now beats SDPA. See
+   > [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md)
+   > (correction) and
+   > [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md)
+   > (the fix).
+
 2. **K-split across warps is the right move when single-warp blocks
    under-fill SMs.** Phase 1 v4 (FlashDecoding split-K) tried this for
    *attention* and lost — but attention had the per-iter dependency-
@@ -282,6 +295,18 @@ trade-off.
    chain (just FMAs in parallel), so K-split converts compute purely.
    The same idea, different outcome — pattern-recognise the workload
    shape before transferring optimizations.
+
+   > **⚠ Phase 7 / ✅ Phase 8:** The "v4 attention split-K lost because
+   > attention has a per-iter dependency-chain ceiling we couldn't lift"
+   > read is retired. The real ceiling was **occupancy** (single-warp
+   > blocks fill ~2 of 128 SMs), not the reduction chain. Phase 8's v6 —
+   > FlashDecoding split-K on *multi-warp* blocks (4 warps/block, 4-deep
+   > unrolled loads) — lifted exactly that ceiling and now beats GQA-
+   > native SDPA on HBM-bound shapes (v6 155.6 µs vs SDPA 157.3 µs at
+   > batch=8 kv=4096; 4.59× over v3). So K-split *does* transfer to
+   > attention — the earlier failure was the block shape, not the
+   > algorithm. See
+   > [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 3. **Multi-warp blocks pay back when there's K-side compute to split.**
    In Phase 2c we saw the symmetric move on the K side (per-group K

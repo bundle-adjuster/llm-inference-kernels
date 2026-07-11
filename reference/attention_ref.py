@@ -85,11 +85,21 @@ def sdpa_attention(
     *,
     causal: bool = False,
 ) -> torch.Tensor:
-    """PyTorch SDPA — dispatches to FlashAttention / cuDNN. A SOTA baseline.
+    """PyTorch SDPA over a GQA-*expanded* KV cache — NOT a fair baseline.
 
     Same input/output contract as `eager_attention` but goes through
     `F.scaled_dot_product_attention`, which on Ada GPUs dispatches to
     FlashAttention-2 or cuDNN's flash-attention backend.
+
+    WARNING: this first calls `_expand_gqa`, materializing the 8 KV heads
+    into 32 (a 4x-larger KV cache) before handing them to SDPA. That is the
+    *handicapped* path — SDPA then reads 4x the KV bytes it needs to. The
+    "1.36 ms / 1.91x over SDPA" headline the old v3 kernel once claimed came
+    from beating exactly this handicapped baseline; against the fair,
+    GQA-native path it was 4.55x *slower* (see docs/05). The fair baseline is
+    `F.scaled_dot_product_attention(q, k, v, enable_gqa=True)` with the
+    UNEXPANDED 8-head KV cache. The v6 split-K kernel matches that fair
+    baseline (1.01x) on HBM-bound shapes — see docs/06-attention-splitk-journey.md.
     """
     k, v = _expand_gqa(k, v, q.shape[1])
     return F.scaled_dot_product_attention(q, k, v, is_causal=causal)

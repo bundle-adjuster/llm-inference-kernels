@@ -35,12 +35,22 @@ Legend: `[ ]` todo · `[~]` in progress / partial / explored-not-landed · `[x]`
 
 ## Phase 1 — Fused attention  (design doc: `docs/01-fused-attention.md`)
 
-Current state on `main`: **v3 (single-warp block + vectorized 64-bit KV
-loads), 0.713 ms / 189 GB/s** at the reference workload — 2.34× over v0,
-1.91× faster than PyTorch SDPA. See
+Current state on `main`: **v6 (FlashDecoding split-K on multi-warp blocks —
+4 warps/block, 4-deep unrolled KV loads), 155.6 µs at the reference workload
+(batch=8, kv_len=4096) — 1.01× vs GQA-native PyTorch SDPA (it *beats* SDPA),
+4.59× over the old v3, ~82% of peak HBM.** The binding `decode_attention`
+now dispatches to v6; the old kernel is preserved as `decode_attention_v3`.
+The old v3 (single-warp block, 0.713 ms / 189 GB/s, 2.34× over v0) was
+**retired in Phase 7**: measured against a *fair* GQA-native baseline
+(`F.scaled_dot_product_attention(..., enable_gqa=True)`), v3 was 4.55×
+*slower* (0.22×) because its single-warp block is **occupancy-bound**
+(fills ~2 of 128 SMs), not bandwidth-bound. Phase 8's v6 fixes exactly that.
+See [`docs/06-attention-splitk-journey.md`](docs/06-attention-splitk-journey.md)
+for the fix and
+[`docs/05-baseline-correction-journey.md`](docs/05-baseline-correction-journey.md)
+for the baseline correction; the full v0–v5 narrative is in
 [`docs/01-fused-attention-journey.md`](docs/01-fused-attention-journey.md)
-for the full v0–v5 narrative (theory, design, result, lesson per step,
-including the v4/v5 explorations that didn't land).
+(theory, design, result, lesson per step).
 
 ### 1a. Reference + correctness
 - [x] `reference/attention_ref.py`: naive eager attention (QK^T, softmax, ·V)
@@ -57,21 +67,26 @@ including the v4/v5 explorations that didn't land).
 - [x] Online (streaming) softmax — single pass  (v1: `46ae1ea` naive port regressed; `ad9c57f` V-prefetch fix → 1.637 ms / 82 GB/s)
 - [x] Warp-level reductions for dot-products and softmax stats  (v2, commit `db6ab0b` — single-sync block reduce via double-buffered shmem → 1.069 ms / 126 GB/s)
 - [x] Vectorized 128-bit (`float4`) coalesced KV loads  (v3, commit `ccdb6df` — landed as 64-bit per-thread `uint2` for clean head_dim=128 mapping with a single-warp block → 0.713 ms / 189 GB/s. Going to true 128-bit per-thread vec would require multi-`j`-per-iter state management, deferred.)
-- [~] Split-K over the KV sequence + partial-result combine (FlashDecoding)  (v4 explored at `f904aae`, reverted in `e39c97f` — regressed across every batch size tested; our workload was per-SM bandwidth-bound, not grid-undersized)
+- [x] Split-K over the KV sequence + partial-result combine (FlashDecoding)  (v4 explored at `f904aae`, reverted in `e39c97f`; the "per-SM bandwidth-bound, not grid-undersized" diagnosis was **wrong** — the real limiter was occupancy (the single-warp block filled ~2 of 128 SMs). Phase 8's **v6** re-did split-K on multi-warp blocks (4 warps/block) in `kernels/attention/fused_attention_splitk.cu` and landed: 155.6 µs, 4.59× over v3, beats fair GQA-native SDPA — see `docs/06-attention-splitk-journey.md`)
 - [~] `cp.async` double-buffering of KV tiles  (v5 explored at `78a28ff`, reverted in `4254ce2` — regressed by ~50 µs; nvcc was already pipelining v3's loads implicitly, so the explicit pipeline cost more in shmem hop than it saved in overlap)
 - [ ] (stretch) Tensor Core MMA path; (stretch) prefill FA-2 forward kernel
 - [ ] After each step: `ncu` profile, log before/after in RESULTS.md  (every "Cause" cell in RESULTS.md still says "ncu pending"; needs the GPU clocks locked first)
 
 ### 1d. Compare + write up  (CUDA vs Python / SOTA)
-- [~] Benchmark vs PyTorch eager, `F.sdpa`, `flash_attn`  (eager + SDPA done in `benchmarks/bench_attention.py`; `flash_attn` direct row in RESULTS.md still TBD — SDPA dispatches to FA/cuDNN so we have an indirect read)
-- [ ] Roofline placement; explain the gap to SOTA with profiler metrics  (we're at 189/1008 GB/s ≈ 19% of peak HBM; no roofline plot yet, no `ncu` metrics)
+- [x] Benchmark vs PyTorch eager, `F.sdpa`, `flash_attn`  (Phase 8: v6 measured against **GQA-native** `F.scaled_dot_product_attention(..., enable_gqa=True)`, which dispatches to FlashAttention/cuDNN — v6 = 1.01× on the reference workload (batch=8, kv_len=4096), i.e. within 20% of flash. See `docs/06-attention-splitk-journey.md`. The earlier eager/SDPA rows fed SDPA a 4×-expanded GQA KV cache and were **retired in Phase 7** — see `docs/05-baseline-correction-journey.md`.)
+- [ ] Roofline placement; explain the gap to SOTA with profiler metrics  (Phase 8 v6 reaches ~82% of peak HBM on the HBM-bound reference workload — up from v3's 189/1008 GB/s ≈ 19%; the honest remaining gap is L2-resident shapes (kv ≤ 1024), where v6 trails flash's L2 blocking at 0.69–0.82×. No roofline plot yet, no `ncu` metrics — see `docs/06-attention-splitk-journey.md`)
 - [x] Findings section in `docs/01-fused-attention.md`  (summary + 6 lessons; full narrative in `docs/01-fused-attention-journey.md`)
 
-**Exit criterion:** Track 1 *Target* met (within 20% of `flash_attn` on
-achieved bandwidth — see `docs/00`), write-up complete.  We beat
-PyTorch SDPA by 1.91× and are 1.27× over the *Threshold* (≥3× PyTorch
-eager — we're at 5.3×); the *Target* comparison vs raw `flash_attn`
-remains pending.
+**Exit criterion:** Track 1 *Target* met — **Phase 8's v6 split-K beats a
+fair, GQA-native SDPA baseline (1.01× on the reference workload, i.e. within
+20% of `flash_attn`; 4.59× over the old v3)**, and still clears the
+*Threshold* (≥3× PyTorch eager). The old "we beat PyTorch SDPA by 1.91×"
+claim was **retired in Phase 7**: that baseline fed SDPA a 4×-expanded GQA
+KV cache; against GQA-native SDPA the v3 kernel was 4.55× *slower*
+(occupancy-bound, not bandwidth-bound). v6 is what actually met the Target —
+see [`docs/06-attention-splitk-journey.md`](docs/06-attention-splitk-journey.md).
+Remaining honest gap: L2-resident shapes (kv ≤ 1024), where v6 trails at
+0.69–0.82×.
 
 ---
 

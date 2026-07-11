@@ -8,6 +8,33 @@
 >
 > Every numbered step corresponds to a git commit; hashes are inline so you
 > can `git show <hash>` for the diff.
+>
+> ---
+>
+> **⚠ Read this first (added in Phase 7).** The baseline this entire document
+> races against — "PyTorch SDPA, 1.36 ms" — is SDPA handed a **4×-expanded GQA
+> key/value cache** (`reference/attention_ref.py:94`, `_expand_gqa`). SDPA's
+> native GQA path does the same work in **157.7 µs**. Against it, v3 is **4.55×
+> slower**, not 1.91× faster.
+>
+> Worse, the v4 diagnosis below ("bandwidth was the ceiling") is false: flash's
+> `flash_fwd_splitkv_kernel` reaches **81% of peak HBM** on this exact workload
+> where v3 reaches 18%. **v3 is occupancy-bound** — the single-warp block it
+> adopts in the v3 step caps per-SM occupancy at 33%. Split-K was the right
+> idea, applied to a block geometry that had already given the parallelism away.
+>
+> The CUDA-vs-CUDA story below (v0 → v3, and *why* each step moved) is sound and
+> worth reading. Only the "vs SDPA" column and the v4 conclusion are wrong.
+> Full analysis: [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md).
+>
+> **✅ Phase 8 fixed it.** The v6 kernel (`kernels/attention/fused_attention_splitk.cu`)
+> is FlashDecoding split-K on **multi-warp blocks** (4 warps/block) with a 4-deep
+> unrolled load loop — exactly the direction v3 closed off. On this reference
+> workload v6 is **155.6 µs vs GQA-native SDPA's 157.3 µs (1.01×, beats it)** at
+> **~82% of peak HBM** (v3 was 18%), and **4.59× over v3**. The binding
+> `decode_attention` now dispatches to v6; the old kernel is preserved as
+> `decode_attention_v3`. See
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 ## Setting
 
@@ -173,6 +200,12 @@ Two ideas combine:
 **1.27× faster than PyTorch SDPA.** Max `|abs diff|` = 3.1e-5. Register
 count 29 → 28; shmem 132 B → 256 B (the second buffer slot).
 
+> **⚠ Phase 7 / ✅ Phase 8:** the "1.27× faster than PyTorch SDPA" here is
+> against the 4×-expanded-GQA baseline; GQA-native SDPA is 157.7 µs, so v2
+> actually loses. The CUDA-vs-CUDA ratios (1.53× over v1, 1.56× over v0) stand.
+> The kernel that finally beats fair SDPA is v6 split-K —
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
+
 ### What surprised us
 
 The eliminated sync alone predicted ~150 µs of savings. We measured ~570 µs.
@@ -235,6 +268,14 @@ removal beats the lost latency-hiding warps. We measured before merging.
 
 **0.713 ms / 189 GB/s — 1.50× over v2, 2.34× over v0, 1.91× over PyTorch
 SDPA.** Max `|abs diff|` = 3.1e-5. Register count 28 → 33; shmem 256 B → 0 B.
+
+> **⚠ Phase 7 / ✅ Phase 8:** the "1.91× over PyTorch SDPA" is against the
+> expanded-GQA baseline. Against GQA-native SDPA (157.3 µs) v3 is **4.55×
+> slower** (0.22×) — the single-warp block is **occupancy-bound** (~2 of 128
+> SMs, 18% of peak HBM), not bandwidth-bound. The 1.50×/2.34× CUDA-vs-CUDA
+> ratios remain valid. Phase 8's v6 restores multi-warp blocks + split-K and
+> hits **155.6 µs (1.01×, beats fair SDPA), 4.59× over v3, ~82% of peak HBM** —
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 ### What we learned
 
@@ -318,6 +359,17 @@ grid-bound, even at batch=1.
 This optimization belongs in the toolkit for workloads where v3 truly
 underfills the GPU *and* has bandwidth headroom (e.g. tiny batches on
 GPUs with very high SM counts and low per-SM bandwidth pressure).
+
+> **⚠ Phase 7 / ✅ Phase 8 — this lesson was the misdiagnosis.** Our
+> `batch × n_heads = 256` workload was **not** bandwidth-bound: a single-warp
+> block fills ~2 of the 4090's 128 SMs, so it was *occupancy*-bound, with the GPU
+> ~96% idle. Fair GQA-native SDPA reaches 81% of peak HBM on the identical bytes
+> where v3 reaches 18% — the ceiling blamed here does not exist. Split-K **was**
+> the right tool; v4 just bolted it onto the single-warp block that had already
+> given the occupancy away. Phase 8's **v6** does split-K on 4-warp blocks and
+> **beats fair SDPA** (155.6 µs, 1.01×, 4.59× over v3, ~82% of peak). See
+> [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md) and
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 
 ### Decision
 
@@ -403,6 +455,14 @@ bottleneck. For us, ~189 GB/s of 1008 peak is only 19% — so latency
 isn't fully hidden — but the per-SM bandwidth is the ceiling (we proved
 that in v4), and `cp.async` doesn't change per-SM bandwidth.
 
+> **⚠ Phase 7 / ✅ Phase 8:** "the per-SM bandwidth is the ceiling (we proved
+> that in v4)" is false — v4 proved no such thing. v3 was **occupancy-bound**
+> (18% of peak HBM, ~2 of 128 SMs), not bandwidth-bound; flash reaches 81% on the
+> same bytes. `cp.async` didn't help because a single warp per block keeps too
+> few loads in flight, not because HBM was saturated — the real fix was **more
+> warps and more blocks** (Phase 8's v6 split-K, ~82% of peak). See
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
+
 ### Decision
 
 v5 source preserved at `78a28ff`; follow-up commit restores v3 on `main`.
@@ -411,15 +471,23 @@ v5 source preserved at `78a28ff`; follow-up commit restores v3 on `main`.
 
 ## Summary
 
+> **⚠ The `vs SDPA` column is against the expanded-GQA baseline and is inflated
+> ~8.7×.** GQA-native SDPA is 157.7 µs (812 GB/s); every kernel below loses to
+> it. The `vs v0` column is CUDA-vs-CUDA and remains valid.
+> **✅ Phase 8:** the v6 split-K kernel (not in this table) lands at 155.6 µs —
+> **1.01×, the first to beat fair SDPA** — see
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
+
 | Step                        | Latency   | BW (GB/s) | vs v0    | vs SDPA  |
 |-----------------------------|----------:|----------:|---------:|---------:|
+| **SDPA, GQA-native (real SOTA)** | **0.158 ms** | **812** | **10.6×** | **8.62×** |
 | PyTorch eager               | 3.77 ms   |    —      | 0.44×    | 0.36×    |
-| PyTorch SDPA (FA / cuDNN)   | 1.36 ms   |    —      | 1.23×    | 1.00×    |
+| PyTorch SDPA (expanded GQA) | 1.36 ms   |    —      | 1.23×    | 1.00×    |
 | v0 (two-pass softmax)       | 1.669 ms  |    80     | 1.00×    | 0.82×    |
 | v1 naive (regressed)        | 2.078 ms  |    65     | 0.80×    | 0.66×    |
 | v1 + V prefetch             | 1.637 ms  |    82     | 1.02×    | 0.83×    |
 | v2 (single-sync reduce)     | 1.069 ms  |   126     | 1.56×    | 1.27×    |
-| **v3 (vec loads, 1-warp)**  | **0.713 ms** | **189** | **2.34×** | **1.91×** |
+| **v3 (vec loads, 1-warp)**  | **0.713 ms** | **189** | **2.34×** | **1.91×** (Phase 7: retired, 0.22× vs fair SDPA; Phase 8 v6 beats it — see docs/06) |
 | v4 split-K (reverted)       | 0.802 ms  |   167     | 2.08×    | 1.70×    |
 | v5 cp.async (reverted)      | 0.760 ms  |   177     | 2.20×    | 1.79×    |
 
@@ -471,3 +539,22 @@ v5 source preserved at `78a28ff`; follow-up commit restores v3 on `main`.
   GB/s, 1.91× faster than PyTorch SDPA on the reference workload.** The
   stretch goals — tensor-core MMA path, prefill FA-2 forward kernel —
   remain open in the docs/01 roadmap.
+
+  > **⚠ Phase 7 reopens this.** The roadmap was declared exhausted against a
+  > handicapped baseline, and against a bandwidth ceiling that does not exist.
+  > v3 sits at 18% of peak HBM; flash's split-KV kernel reaches 81% on the same
+  > bytes. The unexplored direction is the one v3 closed off: **multi-warp
+  > blocks to recover the 33% occupancy, then split-K over the sequence.**
+  > That is what FlashDecoding does and what our v4 tried to bolt onto a
+  > one-warp block. See
+  > [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md).
+  >
+  > **✅ Phase 8 closed it.** That exact direction — 4 warps/block + split-K with
+  > a 4-deep unrolled load loop — became **v6**
+  > (`kernels/attention/fused_attention_splitk.cu`). Phase 1 is *not* done at
+  > "0.713 ms, 1.91× faster"; the true endpoint is **v6 at 155.6 µs, 1.01× over
+  > GQA-native SDPA (the first fair-baseline win), 4.59× over v3, ~82% of peak
+  > HBM**, within 2.4e-4 of SDPA. v6 beats fair SDPA on HBM-bound shapes
+  > (kv≥2048) and trails on L2-resident shapes (kv≤1024, 0.69–0.82×) — that L2
+  > gap is the honest remaining boundary. Full writeup:
+  > [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).

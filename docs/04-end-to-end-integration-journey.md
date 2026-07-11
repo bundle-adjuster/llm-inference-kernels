@@ -21,6 +21,31 @@
 > chain into a saved chain; 4c's W4A16 delivers 51% memory reduction but
 > a tok/s *regression* at batch=16 — and the cause is a kernel-design
 > assumption (M=1) that the e2e workload violates.
+>
+> ---
+>
+> **⚠ Phase 7 correction.** Two of those three attributions are wrong, because
+> the `vanilla HF` baseline carries ~14 ms/step of overhead that no kernel of
+> ours touches:
+>
+> - **4a** delivers +2.5% not because attention is small (it is ~35% of the
+>   step, not ~4% — the estimate below computes traffic on the un-expanded
+>   cache HF never uses), but because it hooks `F.sdpa`, which HF calls *after*
+>   `repeat_kv` has already run. 4a pays the expansion, pays a second copy to
+>   undo it, and swaps in a kernel slower than the one it replaced. **✅ Phase 8**
+>   fixes the kernel: the v6 split-K `decode_attention` now *beats* fair
+>   GQA-native SDPA (1.01×) — see
+>   [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
+> - **4b**'s 1.55× is not the KIVI kernel. It is `repeat_kv` removal — 4b's
+>   forward replacement skips it. Stock fp16 SDPA with `enable_gqa=True` scores
+>   **535.2 tok/s** against 4b's 521.7, with no accuracy cost. **4b is a memory
+>   result, not a speed result.**
+> - **4c** was graded on the wrong curve. In the fair step the projection GEMM
+>   is **82%** of the time (vs 43% in the vanilla step), which makes W4A16 a
+>   far larger prize than this document concludes — and the only lever that
+>   breaks the 15.01 GB/step weight roofline vLLM shares with us.
+>
+> Full analysis: [`05-baseline-correction-journey.md`](05-baseline-correction-journey.md).
 
 ## Setting
 
@@ -133,6 +158,16 @@ end-to-end? Two reasons it might not:
    expects the GQA shape; if we don't undo the expansion, we read 4×
    the KV bandwidth and lose the whole reason we built it.
 
+> **⚠ Phase 7 / ✅ Phase 8:** The 1.91× above was measured against a handicapped
+> baseline — SDPA fed a 4×-expanded GQA KV cache. Against **GQA-native** SDPA
+> (`F.scaled_dot_product_attention(..., enable_gqa=True)`) the v3 kernel is
+> actually **4.55× slower** (0.22×) on this very workload (batch=8, kv_len=4096):
+> SDPA 157.3 µs vs v3 713.7 µs — v3's single-warp block is occupancy-bound
+> (fills ~2 of 128 SMs), not bandwidth-bound. Phase 8's **v6** FlashDecoding
+> split-K kernel (4 warps/block) is what finally beats fair SDPA: **155.6 µs,
+> 1.01×** (4.59× over v3, ~82% of peak HBM vs v3's 18%). Full story:
+> [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
+
 ### Design choices
 
 - **Patch surface**: rebind `F.scaled_dot_product_attention`. HF looks up
@@ -180,6 +215,12 @@ attention saves <1 ms / 41 ms ≈ 2%.
   This is the standard "Amdahl says hi" outcome — and it's why the *next*
   step (4b) was structurally able to do much better, by attacking a
   bigger fraction of the step.
+
+  > **⚠ Phase 7 / ✅ Phase 8:** The Amdahl lesson holds, but the "1.91×
+  > faster on attention alone" premise does not — vs fair GQA-native SDPA the
+  > v3 kernel was 4.55× *slower*. Phase 8's v6 split-K kernel is what actually
+  > beats fair SDPA (1.01×). See
+  > [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 - **GQA awareness has to be respected at every layer.** HF's
   `repeat_kv`-before-SDPA is a serving-stack convention; our kernel
   assumes the pre-`repeat_kv` shape. The slice-and-`.contiguous()` un-do
@@ -447,6 +488,14 @@ workload (batch=16, prompt=512, generate=512):
    structure (Phase 2c's lesson) and *also* skipped HF's `repeat_kv` +
    SDPA dispatch overhead. The microbench number is necessary, not
    sufficient.
+
+   > **⚠ Phase 7 / ✅ Phase 8:** 4a's "1.91× microbench" was against a
+   > 4×-expanded (handicapped) SDPA, and attention is ~35% of the *vanilla*
+   > step, not ~4% (the ~4% estimate computed traffic on the un-expanded cache
+   > HF never uses). Vs fair GQA-native SDPA the v3 kernel was 4.55× *slower*;
+   > Phase 8's v6 split-K kernel is what beats fair SDPA (1.01×). The
+   > "in proportion to the fraction of time the kernel was on" lesson still
+   > stands. See [`06-attention-splitk-journey.md`](06-attention-splitk-journey.md).
 2. **Memory wins are sticky and immediate; latency wins depend on
    workload alignment.** The 51% peak VRAM cut at 4c is the most
    robust result in Phase 4 — it doesn't depend on M, on batch, on
@@ -609,6 +658,16 @@ A back-to-back microbenchmark of 7 same-shape `w4a16_gemm` calls (one
 layer's worth) shows 173 µs/call vs 153 µs single-call — only 13%
 overhead between back-to-back calls. So launch overhead alone isn't
 saturating us at this M.
+
+> **⚠ Phase 7: this hypothesis is untested and the prior is bad.** On the
+> *vanilla* model, a profiler run puts GPU-busy time at 37.25 ms against 37.22 ms
+> of wall time — **host stall is exactly zero**, across 1429 launches/step. That
+> does not refute the claim below (which is about the W4A16-patched model, whose
+> `QuantizedLinear.forward` is much more Python-heavy), but it does mean nobody
+> has measured it. **Measure host stall on the 4c path before spending Phase 7
+> on CUDA graphs.** The competing explanation — that the W4A16 kernel is simply
+> still slower than cuBLAS at M=16, which Phase 6 itself measures as a 1.7× gap —
+> requires no new mechanism.
 
 The likely cause is **Python/PyTorch dispatch overhead per Linear call.**
 `QuantizedLinear.forward` runs through nn.Module's `__call__`, reshape,

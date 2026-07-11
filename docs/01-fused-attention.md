@@ -81,7 +81,10 @@ below improves, one measured step at a time.
 2. **Warp-level reductions** — `__shfl_down_sync` for dot-products and for
    `m`/`l`; kill shared-memory reduction traffic.
 3. **Vectorized loads** — `float4` / 128-bit loads; ensure coalesced, aligned
-   KV access. Expect a large jump (this kernel is bandwidth-bound).
+   KV access. Expect a large jump (this kernel is bandwidth-bound). *(In
+   practice the realized bottleneck through v3 was **occupancy**, not
+   bandwidth — a single-warp block fills ~2 of 128 SMs; see Findings and
+   [docs/06](06-attention-splitk-journey.md).)*
 4. **Split-K over KV (FlashDecoding)** — multiple blocks per head + combine
    kernel. The decisive win at low batch; target near-peak occupancy.
 5. **`cp.async` double-buffering** — overlap KV tile loads with compute
@@ -130,13 +133,33 @@ most) — lives in [`01-fused-attention-journey.md`](01-fused-attention-journey.
 The per-step latency / bandwidth table is in
 [`results/RESULTS.md`](results/RESULTS.md).
 
-Current state on `main`: **v3, single-warp block + vectorized 64-bit KV
-loads, 0.713 ms / 189 GB/s at the reference workload — 2.34× over the v0
-baseline and 1.91× faster than PyTorch SDPA.** Both v4 (FlashDecoding
-split-K) and v5 (`cp.async` double-buffer) were explored and reverted —
-each regressed by ~50–90 µs across the batch sweep, for different reasons
-(bandwidth-bound at the per-SM ceiling for v4; per-iter shmem hop cost
-for v5).
+Current state on `main`: **v6, FlashDecoding split-K on multi-warp blocks
+(4 warps/block) with a 4-deep unrolled load loop — 155.6 µs at the Phase 1
+reference workload (batch=8, kv_len=4096), ~82% of peak HBM, 4.59× over the
+old v3 kernel and 1.01× vs GQA-native PyTorch SDPA (157.3 µs), i.e. it
+*beats* a fair SDPA.** The binding `decode_attention` now dispatches to v6
+(source `kernels/attention/fused_attention_splitk.cu`); the old kernel is
+preserved as `decode_attention_v3`. v6 wins on the HBM-bound shapes
+(kv≥2048: 1.01–1.02×) and trails on L2-resident shapes (kv≤1024:
+0.71–0.82×, where it loses to flash's L2 blocking) — that L2 gap is the
+honest remaining boundary. Correctness is within 2.4e-4 of GQA-native SDPA.
+The full writeup is [docs/06](06-attention-splitk-journey.md).
+
+**Correction (Phase 7 → 8):** the retired "0.713 ms / 189 GB/s, 2.34× over
+v0, 1.91× faster than PyTorch SDPA" headline for v3 measured SDPA against a
+4×-expanded GQA KV cache — a handicapped baseline. Against GQA-native SDPA
+(`enable_gqa=True`) v3 is actually **4.55× slower** (0.22×) on its own
+reference workload, because its single-warp block is occupancy-bound
+(fills ~2 of 128 SMs), *not* bandwidth-bound. The v4 split-K revert's
+"bandwidth was the ceiling" diagnosis was therefore wrong; Phase 8 confirms
+occupancy was the real issue, and v6 (split-K done right, on multi-warp
+blocks) is what finally beats a fair SDPA. History and the correction:
+[docs/05](05-baseline-correction-journey.md); the fix: [docs/06](06-attention-splitk-journey.md).
+The v4 (FlashDecoding split-K) and v5 (`cp.async` double-buffer) explorations
+still happened and were reverted at the time — but the roadmap they were
+thought to have exhausted was reopened and delivered in Phase 8.
+(The v2/v3 CUDA-vs-CUDA ratios — v3 = 2.34× over v0, 1.50× over v2 — remain
+correct; only the "faster than SDPA" framing was against a rigged baseline.)
 
 Key lessons from this phase:
 
@@ -149,8 +172,14 @@ Key lessons from this phase:
    v2's structural change beat the sync-removal prediction by 4×.
 4. **Occupancy is a means, not an end** — v3 traded 4 warps/block for 1
    warp/block and won 1.50× because the lost warps were idle at barriers.
-5. **Don't add parallelism where the bottleneck isn't compute** — v4's
-   split-K added SMs but couldn't unlock more bandwidth from the same pie.
+5. **Split-K must add warps, not just blocks** — the v4 revert concluded
+   its split-K "couldn't unlock more bandwidth from the same pie." That
+   diagnosis was wrong: v3 was occupancy-bound (~2 of 128 SMs), not
+   bandwidth-bound. Phase 8's v6 split-K on **multi-warp** blocks (4
+   warps/block) unlocked ~82% of peak HBM and beat a fair SDPA — the real
+   lesson is that v4 split the sequence but kept the single-warp block, so
+   it never fixed the actual occupancy ceiling. See
+   [docs/06](06-attention-splitk-journey.md).
 6. **`cp.async` needs heavy per-tile compute to amortise its shmem hop** —
    v5 paid an extra shmem write + read per iter, and nvcc was already
    doing the implicit pipelining anyway, so the explicit version lost.
@@ -158,5 +187,8 @@ Key lessons from this phase:
 Still open: headline comparison against `flash_attn`'s decode kernel
 (SDPA dispatches to FA/cuDNN but a direct apples-to-apples run is pending),
 and `ncu` profile with locked clocks for the "Cause" column in RESULTS.md.
-Phase 1's optimization roadmap (v0–v5) is exhausted; the stretch goals —
-tensor-core MMA path and prefill FA-2 forward — remain.
+Phase 1's optimization roadmap was *not* exhausted at v5: Phase 8 reopened
+step 4 (FlashDecoding split-K) and delivered it correctly as v6 — split-K
+on multi-warp blocks, which finally beat a fair SDPA (see
+[docs/06](06-attention-splitk-journey.md)). The stretch goals — tensor-core
+MMA path and prefill FA-2 forward — remain.

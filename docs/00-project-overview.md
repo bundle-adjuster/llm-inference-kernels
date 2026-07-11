@@ -75,6 +75,16 @@ considered done; "Target" is the goal; "Stretch" is a strong result.
 - **Target:** within 20% of `flash_attn` decode on achieved HBM bandwidth.
 - **Stretch:** within 10%; working prefill FA-2 forward path.
 
+> **Status (Phase 8):** Target met and exceeded. The v6 FlashDecoding split-K
+> kernel matches GQA-native `F.scaled_dot_product_attention` on the Phase 1
+> reference workload (155.6us vs 157.3us = 1.01×, ~82% of peak HBM), and beats it
+> on all HBM-bound shapes (kv≥2048). It trails only on small L2-resident shapes
+> (kv≤1024, 0.69–0.82×), which is the honest remaining boundary. Note: the older
+> v3 kernel actually *lost* to a fair GQA-native baseline (0.22×) — the earlier
+> "1.91× over SDPA" figure compared against SDPA fed a 4×-expanded GQA KV cache.
+> See `docs/05-baseline-correction-journey.md` (the correction) and
+> `docs/06-attention-splitk-journey.md` (the v6 fix).
+
 ### Track 2 — KV-cache compression
 - **Threshold:** INT8 KV correct; 2× KV memory reduction; perplexity delta < 0.2.
 - **Target:** INT4 KV (per-channel K, per-token V); ~3.5–4× memory reduction;

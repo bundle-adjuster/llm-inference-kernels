@@ -576,11 +576,26 @@ n_heads` × decode steps to give wall-clock cost.
 ### What success looks like
 
 For a **kernel-level** win:
-- **Latency**: as fast as PyTorch SDPA. SDPA dispatches to
-  FlashAttention/cuDNN — the state of the art. On our reference
-  workload, SDPA hits 1.36 ms; our v3 hits 0.713 ms — 1.91× faster.
-- **Bandwidth**: meaningful fraction of HBM peak. Our v3 hits 189 GB/s
-  of 1008 GB/s peak (19%). Not at peak, but well into useful range.
+- **Latency**: at least as fast as PyTorch SDPA — but *only* measured
+  against a **fair** SDPA baseline. SDPA dispatches to
+  FlashAttention/cuDNN, the state of the art. Beware the handicapped
+  comparison this book originally made: our first numbers pitted the
+  kernel against SDPA fed a **4×-expanded GQA KV cache** (K/V physically
+  repeated out to 32 heads), so SDPA was reading 4× the bytes it should.
+  That rigged baseline read "1.36 ms," and the old single-warp v3 kernel
+  looked "1.91× faster" (0.713 ms). Against **GQA-native SDPA**
+  (`F.scaled_dot_product_attention(..., enable_gqa=True)` — 157.3 µs on
+  the Phase 1 reference shape) that same v3 is in fact **4.55× *slower***
+  (713.7 µs, 0.22×), because v3's single-warp block is
+  **occupancy-bound** — it fills only ~2 of the 4090's 128 SMs — not
+  bandwidth-bound. The fix (Phase 8) is **FlashDecoding split-K on
+  multi-warp blocks**, kernel **v6**: 155.6 µs, ~82% of peak HBM, which
+  finally *beats* fair SDPA (1.01×). See docs/05 (the baseline
+  correction) and docs/06 (the v6 fix).
+- **Bandwidth**: a meaningful fraction of HBM peak — and note that the
+  old v3's ~18% of peak (189 GB/s of 1008) was the *symptom* of the
+  occupancy problem, not a badge of honor. v6 pushes this to ~82% of
+  peak.
 
 For a **memory** win:
 - **KV bytes per token** as small as quality allows. fp16 is 4096 B; INT8
@@ -1602,7 +1617,11 @@ goes.
 **1.669 ms / 80 GB/s achieved KV bandwidth** at the reference workload.
 Max |abs diff| vs the fp32 reference is 6e-5 (well within the
 `rtol/atol = 2e-2` correctness gate). 2.26× faster than PyTorch eager
-(3.77 ms); 23% behind PyTorch SDPA (1.36 ms).
+(3.77 ms). (The "1.36 ms SDPA" figure this section originally compared
+against was SDPA handed a 4×-expanded GQA cache — a handicapped
+baseline; see §1.7 and docs/05. Against *GQA-native* SDPA — 157.3 µs on
+the reference shape — every kernel in the v0→v3 arc is several×
+slower; the split-K **v6** kernel is what closes that gap, docs/06.)
 
 This is our **CUDA-vs-CUDA baseline**. Everything from here on is
 relative to v0.
@@ -2002,8 +2021,11 @@ warp slot pressure) all loosen. **Look at the chain, not the sync.**
 
 ### Result
 
-**1.069 ms / 126 GB/s — 1.53× over v1-prefetch, 1.56× over v0.** Now
-1.27× faster than PyTorch SDPA on this workload.
+**1.069 ms / 126 GB/s — 1.53× over v1-prefetch, 1.56× over v0.** (The
+"1.27× faster than PyTorch SDPA" this section originally claimed was
+against the handicapped 4×-expanded-GQA SDPA baseline — see §1.7 /
+docs/05. Against GQA-native SDPA at 157.3 µs, v2 is many× slower. The
+CUDA-vs-CUDA ratios above stand.)
 
 > **Checkpoint 3.4**
 > - In v2's per-iter chain, how many sync barriers are there now?
@@ -2092,8 +2114,14 @@ warp shuffles.
 
 ### Result
 
-**0.713 ms / 189 GB/s — 1.50× over v2, 2.34× over v0, 1.91× faster
-than PyTorch SDPA.** Max |abs diff| = 3e-5.
+**0.713 ms / 189 GB/s — 1.50× over v2, 2.34× over v0.** Max |abs diff|
+= 3e-5. (The retired "1.91× faster than PyTorch SDPA" headline was
+against SDPA fed a 4×-expanded GQA cache. Against GQA-native SDPA —
+157.3 µs — this same v3 is **4.55× *slower***: it is occupancy-bound,
+filling only ~2 of 128 SMs, *not* bandwidth-bound as the v4 revert
+later concluded. Phase 8's FlashDecoding split-K rewrite, **v6**, is
+what actually beats fair SDPA — 155.6 µs, 1.01×. See §1.7, docs/05,
+docs/06. The CUDA-vs-CUDA ratios above stand.)
 
 The bet paid off. The 33% occupancy was fine because the lost warps
 were idle at syncs anyway.
@@ -2200,6 +2228,22 @@ the actual bottleneck, not the shape that resembles a textbook one*.
 
 The v4 split-K code was committed for reference (commit `f904aae`),
 then reverted in `e39c97f`. `main` stays on v3.
+
+> **⚠ Phase 7 / ✅ Phase 8 — this section's diagnosis is wrong.** The
+> conclusion above — "v3 wasn't grid-bound; per-SM bandwidth was the
+> ceiling, so more SMs can't help" — is the load-bearing mistake of the
+> whole attention journey. v3 was actually **occupancy-bound**: its
+> single-warp blocks fill only ~2 of the 4090's 128 SMs. v4's split-K
+> lost not because parallelism can't help, but because v4 kept
+> *single-warp* blocks and merely launched more of them — piling on
+> launch/scratch/combine overhead without raising occupancy or
+> shortening anything. Phase 8's **v6** does split-K *on multi-warp
+> (4-warp) blocks* with a 4-deep unrolled load loop: ~82% of peak HBM
+> (v3 was ~18%), 155.6 µs on the Phase 1 reference shape vs v3's
+> 713.7 µs (4.59×), and it finally beats GQA-native SDPA (157.3 µs) at
+> 1.01×. Split-K was the right hammer all along — v4 just swung it
+> wrong. See docs/05 (correction) and docs/06 (the v6 fix). Read
+> Checkpoint 3.6 below with that in mind.
 
 > **Checkpoint 3.6**
 > - In §2.8's framework, was v3 bandwidth-bound or chain-bound? What
@@ -2312,7 +2356,7 @@ on v3.
 | **v1 prefetch** (fix) | 1.637 ms | 82 GB/s | Hoist V load above the sync manually. |
 | **v2** single-sync reduce | 1.069 ms | 126 GB/s | Drop one sync via double-buffer + redundant cross-warp reduce. Shmem hop removal stacks. |
 | **v3** vec + 1-warp | **0.713 ms** | **189 GB/s** | Trade occupancy for chain. Won big. |
-| v4 split-K (regression) | 0.802 ms | 167 GB/s | More SMs doesn't help when per-SM bandwidth is the ceiling. |
+| v4 split-K (regression) | 0.802 ms | 167 GB/s | Original lesson "more SMs doesn't help when per-SM bandwidth is the ceiling" is **wrong** (Phase 7/8): v3 was occupancy-bound; split-K on *multi-warp* blocks (v6) wins — docs/06. v4 lost by splitting into more *single-warp* blocks. |
 | v5 cp.async (regression) | 0.760 ms | 177 GB/s | Explicit async loads cost more than nvcc's prefetch already gives. |
 
 ## 3.9 Five lessons to take with you
@@ -2335,11 +2379,15 @@ on v3.
    single-warp blocks and won 1.5×. The lost warps were idle at sync
    barriers in v2, not doing useful latency hiding.
 
-5. **Don't add parallelism where the bottleneck isn't compute.** v4
-   split-K added 5× more busy SMs but each SM was still at its
-   per-iter chain limit. More SMs ≠ more throughput when the chain
-   is the ceiling. Same lesson for v5: don't fix latency hiding when
-   it's not the bottleneck.
+5. **Add parallelism the *right way*, or not at all.** v4 split-K
+   added 5× more busy SMs and still lost — but the lesson isn't "more
+   SMs never help here." (Phase 7/8: v3 was occupancy-bound, filling
+   ~2 of 128 SMs, and Phase 8's **v6** wins with split-K *on multi-warp
+   blocks*, ~82% of peak HBM, 1.01× over fair SDPA — docs/06.) v4's
+   real error was splitting K across *more single-warp blocks* instead
+   of across *warps within a block* — extra launch/combine overhead,
+   no occupancy gain. v5's lesson stands as-is: don't fix latency
+   hiding when it's not the bottleneck.
 
 ## 3.10 Closing thoughts
 
@@ -2352,11 +2400,21 @@ step:
 3. *Predict the magnitude.* If your prediction is off by 4×, you're
    missing something — go look at the chain again.
 
-We landed at **v3: 0.713 ms / 189 GB/s — 1.91× over PyTorch SDPA**
-through five iterations and two reverts. Every step in the table
-above is on a separate branch (`v0`, `v1-naive`, `v1`, `v2`, `v3`,
-`v4`, `v5`) — check them out, rebuild, run the bench, and feel the
-numbers in your hands.
+Part 3 as first written landed at **v3: 0.713 ms**, believing it was
+"1.91× over PyTorch SDPA" and that the roadmap was exhausted. Both
+beliefs were wrong. That SDPA number was a handicapped baseline (SDPA
+fed a 4×-expanded GQA cache); against GQA-native SDPA (157.3 µs) v3 is
+4.55× *slower*, and it is **occupancy-bound** (filling ~2 of 128 SMs),
+not chained-out-at-the-ceiling. The real endpoint is Phase 8's **v6** —
+FlashDecoding split-K on multi-warp blocks — which reaches ~82% of peak
+HBM (155.6 µs) and beats fair SDPA 1.01×. The v0→v5 arc above is still
+a faithful record of the CUDA-vs-CUDA progression (each version faster
+than the last against *our own* baseline) and of two instructive
+reverts — read it that way, then read docs/05 for the correction and
+docs/06 for how split-K, done right, finally won. Every step is on a
+separate branch (`v0`, `v1-naive`, `v1`, `v2`, `v3`, `v4`, `v5`) —
+check them out, rebuild, run the bench, and feel the numbers in your
+hands.
 
 Part 4 (KV-cache compression) and Part 5 (cross-cutting lessons)
 build on these foundations. By the end of the book, you should be
@@ -3564,6 +3622,16 @@ on what the kernel's chain looks like.
 > textbook optimization. "Split-K" is a hammer; if your nail is a
 > sync barrier, the hammer doesn't help.
 
+> **⚠ Phase 7 / ✅ Phase 8:** the premise of this section — "K-split
+> worked for GEMM but *failed* for attention" — was later overturned.
+> Phase 8's attention kernel **v6** applies *exactly the 3c recipe*
+> (multi-warp block + split-K) to decode attention and wins: ~82% of
+> peak HBM, 155.6 µs, beating GQA-native SDPA 1.01×. The Phase 1 v4
+> attempt failed only because it split K across *more single-warp
+> blocks* rather than across *warps within a block* — so it never
+> raised occupancy (v3 was occupancy-bound, filling ~2 of 128 SMs).
+> Same hammer as 3c; v4 just aimed it at the wrong nail. See docs/06.
+
 ---
 
 ### 5.7 Weight cache and the L2 story
@@ -3720,8 +3788,12 @@ Common prediction failures from Phases 1-3:
 - **Phase 1 v1 naive**: "online softmax = less work = faster." Wrong
   direction. The diagnosis was incomplete (missed the load-barrier
   consequence).
-- **Phase 1 v4**: "more SMs = more throughput." Wrong magnitude. The
-  prediction assumed bandwidth-bound; actually chain-bound.
+- **Phase 1 v4**: "more SMs = more throughput." The direction was
+  actually *right* (v3 was occupancy-bound, ~2 of 128 SMs) — but v4
+  added blocks while keeping single-warp blocks, so it never raised
+  occupancy. Phase 8's v6 (split-K on multi-warp blocks) is the same
+  idea done right, and it wins (~82% of peak HBM, 1.01× over fair
+  SDPA — docs/06).
 - **Phase 2b INT8 KV**: "half the bytes = ~2× faster." Wrong magnitude
   (was 1×). Same chain-bound diagnosis missed.
 
@@ -3852,8 +3924,11 @@ small to fill the GPU.
 What: multi-warp block, K split across warps, tiny shmem combine for
 the per-column partials.
 
-Where: Phase 3c (worked); Phase 1 v4 attempted (didn't work because
-attention's chain wasn't K-reduction-bound).
+Where: Phase 3c (worked); Phase 8 attention **v6** (worked — same
+multi-warp-block + split-K recipe, ~82% of peak HBM, beats fair SDPA
+1.01×, docs/06). Phase 1 v4 attempted it but split K across *more
+single-warp blocks* instead of across *warps within a block*, so it
+never raised occupancy and lost.
 
 ### 5.16 The six-question checklist
 
