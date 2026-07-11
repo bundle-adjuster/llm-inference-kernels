@@ -15,29 +15,30 @@
 Llama 3.1 8B, `batch=16, prompt=512, generate=512`, greedy, RTX 4090.
 `benchmarks/bench_w4a16_e2e.py`.
 
-| stack | full e2e tok/s | vs vLLM-fp16 | precision |
-|---|---|---|---|
-| vanilla HF (fp16) | 343 | 0.49× | fp16 |
-| **fair fp16** (v6 attn + `enable_gqa`, no cat) | ~600 | ~0.85× | fp16 |
-| vLLM 0.6.6 | **703** | 1.00× | fp16 |
-| **W4A16 + v6 + cat-free** (this repo) | **756** | **1.08×** | **int4 weights** |
-| — decode-only (same stack) | **843** | **1.20×** | int4 weights |
+| stack | full e2e | decode-only | vs vLLM-fp16 (full) | precision |
+|---|---|---|---|---|
+| vanilla HF | 343 | — | 0.49× | fp16 |
+| vLLM 0.6.6 | **703** | — | 1.00× | fp16 |
+| **fp16, our stack** (v6 + cat-free + fused elementwise) | **680** | **742** | **0.97× full, 1.06× decode** | **fp16, lossless** |
+| **W4A16, our stack** | **839** | **933** | **1.19× full, 1.33× decode** | int4 weights |
 
-Two claims, kept separate on purpose:
+Two results, kept separate on purpose:
 
-1. **Kernel quality — matched/beat vLLM, like-for-like.** v6 attention is at
-   parity with SDPA (Phase 8); the W4A16 GEMM beats fp16 cuBLAS at M=16 by
-   **1.66–2.0×** (below). These are apples-to-apples kernel comparisons and are
-   the *solid* result of this phase.
-2. **End-to-end throughput — 756 tok/s, above vLLM-fp16's 703 — but 4-bit vs
-   16-bit.** This is the repo's thesis realized (weight quantization breaks the
-   fp16 weight roofline), *not* a like-for-like win. **W4A16 is lossy** (Phase 4c:
-   MMLU 62.4% vs fp16 68.3%); vLLM-fp16 is lossless. A fair 4-bit-vs-4-bit
-   comparison is against vLLM-AWQ, which we did **not** measure. And at equal
-   precision (fp16 vs fp16) we are still **~0.85×**, short of vLLM.
+1. **Like-for-like (fp16, lossless): matched vLLM.** With v6 attention (== SDPA),
+   the cat-free cache, and fused RMSNorm/SwiGLU/RoPE (Phase 10), the fp16 stack —
+   **100% greedy-identical to the stock model** — runs decode at **742 tok/s,
+   1.06× vLLM**, and full e2e at 680 (0.97×, parity within run-to-run noise). No
+   accuracy caveat: this is equal precision. The decode step is now 86% cuBLAS
+   GEMMs — the same floor vLLM has — so this is about as far as fp16 goes without
+   touching the GEMM.
+2. **W4A16 (4-bit): 839 tok/s full / 933 decode — 1.19× / 1.33× vLLM-fp16.** The
+   repo's thesis realized (weight quantization breaks the fp16 weight roofline).
+   **Caveat, stated up front:** this is int4 weights vs vLLM-*fp16* — a
+   throughput/accuracy trade (W4A16 is lossy: Phase 4c MMLU 62.4% vs 68.3%). A
+   fair 4-bit-vs-4-bit comparison is vs vLLM-AWQ, which we did **not** measure.
 
-So: **the kernels are vLLM-class; the e2e "win" is a throughput/accuracy trade,
-honestly labeled.**
+The underlying kernels are apples-to-apples vLLM-class: v6 == SDPA, and the W4A16
+GEMM beats fp16 cuBLAS at M=16 by **1.66–2.0×** (below).
 
 ## How the GEMM got there — split-K, then one-read dequant
 
@@ -101,13 +102,17 @@ decode) above vLLM-fp16.
 ## What survives, and what's still open
 
 - **Solid:** the kernels are vLLM-class — v6 == SDPA, W4A16 GEMM > cuBLAS,
-  cat-free decode, fused prefill. All correctness-gated, all in `main`.
-- **True but caveated:** W4A16 e2e (756) > vLLM-fp16 (703) — 4-bit vs 16-bit, a
+  cat-free decode, fused prefill, fused RMSNorm/SwiGLU/RoPE. All
+  correctness-gated, all in `main`.
+- **Like-for-like (fp16, lossless): matched.** Decode 1.06× vLLM, full 0.97×
+  (parity within noise), 100% greedy-identical (Phase 10 closed this).
+- **True but caveated:** W4A16 e2e (839) > vLLM-fp16 (703) — 4-bit vs 16-bit, a
   throughput/accuracy trade, not a like-for-like or a quality match.
-- **Open:** (1) fp16-vs-fp16 parity needs the unfused elementwise fused
-  (~6% of the step); (2) the W4A16 GEMM is at ~35% of peak — Marlin-style
-  register dequant is the path to the thesis's projected ~2× over vLLM; (3) a
-  fair 4-bit comparison vs vLLM-AWQ; (4) `ncu` with locked clocks.
+- **Open:** (1) the fp16 step is now GEMM-bound (86% cuBLAS) — further e2e gain
+  means beating cuBLAS at fp16 M=16, or CUDA graphs for the last ~4% host stall;
+  (2) the W4A16 GEMM is at ~35% of peak — Marlin-style register dequant is the
+  path to the thesis's projected ~2× over vLLM; (3) a fair 4-bit comparison vs
+  vLLM-AWQ; (4) `ncu` with locked clocks.
 
 ## Reproduction
 
