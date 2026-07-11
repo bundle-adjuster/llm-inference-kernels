@@ -73,6 +73,20 @@ at an implied ~715 GB/s. Use `gqa` — not `vanilla` — as the denominator for 
 kernel claim. See
 [`../05-baseline-correction-journey.md`](../05-baseline-correction-journey.md).
 
+**✅ Phase 9 — the hand-written stack passes vLLM's throughput (with caveats).**
+With v6 attention (== SDPA), the W4A16 split-K GEMM (now **1.66–2.0× over cuBLAS**
+at M=16), a cat-free preallocated cache (v6's `seqlen` arg reads the live prefix
+in place — the thing SDPA couldn't), and a one-pass fused prefill dequant (38×),
+the end-to-end reaches **756 tok/s — 1.08× vLLM-fp16 (703)**; decode-only 843
+(1.20×). **Caveats, stated up front:** this is **4-bit weights vs vLLM-fp16**, a
+throughput/accuracy trade (W4A16 costs the Phase 4c accuracy delta: MMLU 62.4% vs
+68.3%) — a fair 4-bit comparison is vs vLLM-AWQ, not measured; and **at equal
+precision (fp16 vs fp16) we are ~0.85×**, short of vLLM (residual = unfused
+elementwise). The solid, like-for-like result is the *kernels* (attention == SDPA,
+W4A16 GEMM > cuBLAS). Also measured (refuting Phase 6/7's guess): the W4A16 decode
+step is **96% GPU-bound**, so the residual gap is fusion, not host dispatch. Full
+story: [`../07-w4a16-e2e-journey.md`](../07-w4a16-e2e-journey.md).
+
 ## Track 1 — Fused attention
 
 Microbench workload: Llama 3 8B head config (`n_heads=32, n_kv_heads=8,
