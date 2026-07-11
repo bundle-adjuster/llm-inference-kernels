@@ -335,14 +335,29 @@ torch::Tensor w4a16_gemm(torch::Tensor act,
                 "K must equal n_groups * group_size");
 
     auto out = torch::empty({M, N}, act.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int n_splits = w4a16_n_splits(M, N, K, static_cast<int>(group_size));
+    if (n_splits > 1) {
+        // Batched decode (2 <= M <= 16): tensor-core + split-K over K (Phase 9),
+        // with an fp32 accumulator the split partials atomicAdd into.
+        auto acc = torch::empty({M, N}, act.options().dtype(torch::kFloat32));
+        launch_w4a16_gemm_splitk(
+            reinterpret_cast<const half*>(act.data_ptr<at::Half>()),
+            reinterpret_cast<const uint32_t*>(weight_packed.data_ptr<int32_t>()),
+            reinterpret_cast<const half*>(scale.data_ptr<at::Half>()),
+            acc.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            M, N, K, static_cast<int>(group_size), n_splits, stream);
+        return out;
+    }
 
     launch_w4a16_gemm(
         reinterpret_cast<const half*>(act.data_ptr<at::Half>()),
         reinterpret_cast<const uint32_t*>(weight_packed.data_ptr<int32_t>()),
         reinterpret_cast<const half*>(scale.data_ptr<at::Half>()),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        M, N, K, static_cast<int>(group_size),
-        at::cuda::getCurrentCUDAStream());
+        M, N, K, static_cast<int>(group_size), stream);
 
     return out;
 }

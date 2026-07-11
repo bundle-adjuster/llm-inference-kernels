@@ -30,3 +30,15 @@
 void launch_w4a16_gemm(
     const half* act, const uint32_t* weight_packed, const half* scales,
     half* out, int M, int N, int K, int group_size, cudaStream_t stream);
+
+
+// Batched-decode W4A16 (Phase 9): tensor-core kernel with split-K over K to fix
+// the occupancy wall the Phase 6 kernel hit at M=16 (see quant_matmul.cu).
+// `acc` is caller-allocated fp32 scratch of shape [M, N]; size n_splits with
+// w4a16_n_splits(). Use for 2 <= M <= 16.
+int w4a16_n_splits(int M, int N, int K, int group_size);
+
+void launch_w4a16_gemm_splitk(
+    const half* act, const uint32_t* weight_packed, const half* scales,
+    float* acc, half* out, int M, int N, int K, int group_size,
+    int n_splits, cudaStream_t stream);

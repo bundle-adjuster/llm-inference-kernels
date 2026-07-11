@@ -479,9 +479,170 @@ __global__ void w4a16_gemm_tc_kernel(
 
 
 // ============================================================================
+// v4 tensor-core + split-K (Phase 9). The Phase 6 tc kernel launches only
+// ceil(N / TC_BLOCK_N) blocks — 64 for the N=4096 Llama shapes — and each block
+// grinds the entire K dimension alone. On a 128-SM 4090 that leaves the GPU
+// >50% idle, so it streamed weights at only ~60 GB/s and *lost* to cuBLAS at
+// M=16 (which is why Phase 4c's W4A16 e2e regressed). This is the same occupancy
+// wall the v3 attention kernel had. The fix is the same: split the K dimension
+// across blockIdx.y so the grid grows by n_splits× and fills the SMs. Each block
+// computes its K-slice's partial and atomicAdds it into an fp32 accumulator; a
+// convert pass casts to fp16. The GEMM sum over K is linear, so the split
+// partials add exactly (scales are folded into the dequantized weight before the
+// MMA, so each slice is self-contained).
+// ============================================================================
+
+__global__ void w4a16_gemm_tc_splitk_kernel(
+    const half* __restrict__ act,                  // [M, K]
+    const uint32_t* __restrict__ weight_packed,    // [K/PACK, N]
+    const half* __restrict__ scales,               // [n_groups, N]
+    float* __restrict__ acc,                       // [M, N] fp32, pre-zeroed
+    int M, int N, int K, int group_size, int n_splits) {
+
+    constexpr int THREADS = TC_WARPS * 32;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane    = tid & 31;
+
+    extern __shared__ char smem[];
+    half* act_smem    = reinterpret_cast<half*>(smem);
+    half* weight_smem = act_smem + TC_BLOCK_M * group_size;
+
+    const int block_n_start = blockIdx.x * TC_BLOCK_N;
+    const int warp_n_start  = block_n_start + warp_id * TC_BLOCK_N_PER_WARP;
+
+    // This block owns K-groups [g0, g1). Slicing K (not N) keeps each block's
+    // output tile identical across splits, so their partials share an acc slot.
+    const int n_groups         = K / group_size;
+    const int groups_per_split = (n_groups + n_splits - 1) / n_splits;
+    const int g0 = blockIdx.y * groups_per_split;
+    const int g1 = min(g0 + groups_per_split, n_groups);
+    if (g0 >= n_groups) return;
+
+    fragment<accumulator, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    half* my_weight_smem = weight_smem + warp_id * group_size * TC_BLOCK_N_PER_WARP;
+
+    for (int g = g0; g < g1; ++g) {
+        const int k_start = g * group_size;
+
+        for (int idx = tid; idx < TC_BLOCK_M * group_size; idx += THREADS) {
+            const int m     = idx / group_size;
+            const int k_off = idx % group_size;
+            act_smem[m * group_size + k_off] = (m < M)
+                ? act[m * K + k_start + k_off]
+                : __float2half(0.0f);
+        }
+
+        const int tile_elems = group_size * TC_BLOCK_N_PER_WARP;
+        for (int idx = lane; idx < tile_elems; idx += 32) {
+            const int k             = idx / TC_BLOCK_N_PER_WARP;
+            const int n_col_in_warp = idx % TC_BLOCK_N_PER_WARP;
+            const int n_col         = warp_n_start + n_col_in_warp;
+            const bool valid        = (n_col < N);
+
+            const int      k_pack    = (k_start + k) / PACK;
+            const int      k_in_pack = k % PACK;
+            const uint32_t packed    = valid ? weight_packed[k_pack * N + n_col] : 0u;
+            const int      nibble    = (static_cast<int32_t>(packed)
+                                        << (28 - k_in_pack * 4)) >> 28;
+            const float    scale_v   = valid ? __half2float(scales[g * N + n_col]) : 0.0f;
+            my_weight_smem[k * TC_BLOCK_N_PER_WARP + n_col_in_warp] =
+                __float2half(static_cast<float>(nibble) * scale_v);
+        }
+        __syncthreads();
+
+        fragment<matrix_a, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, half, row_major> a_frag;
+        fragment<matrix_b, TC_WMMA_M, TC_WMMA_N, TC_WMMA_K, half, row_major> b_frag;
+
+        const int wmma_steps = group_size / TC_WMMA_K;
+        #pragma unroll 1
+        for (int wk = 0; wk < wmma_steps; ++wk) {
+            load_matrix_sync(a_frag, act_smem + wk * TC_WMMA_K, group_size);
+            load_matrix_sync(b_frag,
+                             my_weight_smem + wk * TC_WMMA_K * TC_BLOCK_N_PER_WARP,
+                             TC_BLOCK_N_PER_WARP);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();
+    }
+
+    // Stage this split's fp32 partial to shmem, then atomicAdd into the global
+    // accumulator. Reuse act_smem (K loop done) as [WARPS][BLOCK_M, N_PER_WARP].
+    float* part_smem = reinterpret_cast<float*>(act_smem);
+    store_matrix_sync(part_smem + warp_id * TC_BLOCK_M * TC_BLOCK_N_PER_WARP,
+                      c_frag, TC_BLOCK_N_PER_WARP, mem_row_major);
+    __syncthreads();
+
+    for (int idx = tid; idx < M * TC_BLOCK_N; idx += THREADS) {
+        const int m          = idx / TC_BLOCK_N;
+        const int n_in_block = idx % TC_BLOCK_N;
+        const int warp       = n_in_block / TC_BLOCK_N_PER_WARP;
+        const int n_in_warp  = n_in_block % TC_BLOCK_N_PER_WARP;
+        const int n_col      = block_n_start + n_in_block;
+        if (n_col < N) {
+            atomicAdd(&acc[m * N + n_col],
+                      part_smem[warp * TC_BLOCK_M * TC_BLOCK_N_PER_WARP
+                                + m * TC_BLOCK_N_PER_WARP + n_in_warp]);
+        }
+    }
+}
+
+__global__ void w4a16_acc_to_out_kernel(const float* __restrict__ acc,
+                                        half* __restrict__ out, int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = __float2half(acc[i]);
+}
+
+// Pick n_splits so the grid (ceil(N/TC_BLOCK_N) × n_splits) fills the SMs a few
+// waves deep, bounded by the number of K-groups available to split.
+int w4a16_n_splits(int M, int N, int K, int group_size) {
+    if (M <= 1 || M > TC_BLOCK_M) return 1;      // only the batched path splits
+    const int n_groups  = K / group_size;
+    const int grid_base = (N + TC_BLOCK_N - 1) / TC_BLOCK_N;
+    const int TARGET    = 8 * 128;               // fill 128 SMs a few waves deep
+    int n = (TARGET + grid_base - 1) / grid_base;
+    if (n > n_groups) n = n_groups;
+    if (n > 64)       n = 64;
+    if (n < 1)        n = 1;
+    return n;
+}
+
+void launch_w4a16_gemm_splitk(
+    const half* act, const uint32_t* weight_packed, const half* scales,
+    float* acc, half* out, int M, int N, int K, int group_size,
+    int n_splits, cudaStream_t stream) {
+
+    CUDA_CHECK(cudaMemsetAsync(acc, 0, static_cast<size_t>(M) * N * sizeof(float), stream));
+
+    constexpr int THREADS = TC_WARPS * 32;
+    dim3 grid((N + TC_BLOCK_N - 1) / TC_BLOCK_N, n_splits);
+    dim3 block(THREADS);
+    const size_t partial_bytes =
+        static_cast<size_t>(TC_BLOCK_M) * TC_BLOCK_N * sizeof(float);   // fp32 staging
+    const size_t initial_act_bytes =
+        static_cast<size_t>(TC_BLOCK_M) * group_size * sizeof(half);
+    const size_t smem_bytes =
+        (partial_bytes > initial_act_bytes ? partial_bytes : initial_act_bytes)
+        + static_cast<size_t>(TC_WARPS) * group_size * TC_BLOCK_N_PER_WARP * sizeof(half);
+    w4a16_gemm_tc_splitk_kernel<<<grid, block, smem_bytes, stream>>>(
+        act, weight_packed, scales, acc, M, N, K, group_size, n_splits);
+    CUDA_CHECK_LAST();
+
+    const int total   = M * N;
+    const int threads = 256;
+    w4a16_acc_to_out_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+        acc, out, total);
+    CUDA_CHECK_LAST();
+}
+
+
+// ============================================================================
 // Launcher: dispatch
 //   M == 1                   → v1 decode (3c)
-//   1 < M <= 16              → v3 tensor-core (Phase 6)  -- v2 retired from dispatch
+//   1 < M <= 16              → v4 tensor-core + split-K (Phase 9)
 //   M > 16                   → v0 naive (3b)   — catch-all for prefill etc.
 // ============================================================================
 
