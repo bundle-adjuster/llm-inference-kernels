@@ -114,6 +114,38 @@ decode) above vLLM-fp16.
   path to the thesis's projected ~2× over vLLM; (3) a fair 4-bit comparison vs
   vLLM-AWQ; (4) `ncu` with locked clocks.
 
+## Phase 11 — the Marlin attempt (a negative result worth keeping)
+
+The W4A16 GEMM sits at ~35% of peak HBM. ptxas said the wmma split-K kernel is
+not register-bound (40 regs, no spills), and forcing the max shared-memory
+carveout changed nothing — so it is **not occupancy-bound** either. The leading
+hypothesis was the shared-memory round-trip: it dequantizes int4 → fp16 into
+shmem, then reads it back with `load_matrix_sync` (~0.5 B global read but ~4 B
+shmem write+read per weight element, an 8× amplification). Marlin's answer is to
+dequant int4 straight into `mma.sync` registers and never stage fp16 weights.
+
+So I built that: `w4a16_gemm_mma_splitk_kernel`, `mma.sync.m16n8k16` with the
+fragment layout verified against a reference tile first, weights unpacked +
+scaled directly into B-fragment registers, only the activation staged. It is
+**correct** (24 quant tests pass) and it was **slower**: 200–256 GB/s vs the wmma
+kernel's 293–386, on every Llama shape at M=16. Killing the redundant per-group
+weight loads with a shuffle-broadcast didn't help (the hardware already
+broadcasts same-address reads).
+
+The lesson: for a **decode-shape M=16** GEMM the register-dequant win is real but
+small, and it is outweighed by per-K-tile ALU (nibble unpack, `half2` packs, the
+activation `half→float`) and by issuing many tiny 8-wide MMAs. A Marlin kernel
+beats cuBLAS at these shapes by also doing `cp.async` double-buffering of the
+weight stream, `ldmatrix` for the activation, and larger warp tiles — a much
+bigger build, and one that competes against a wmma kernel that is already
+1.66–2.0× over cuBLAS here. I reverted the active path to the wmma kernel and
+kept the mma one as a documented reference. Beating our own kernel — let alone
+vLLM-AWQ's Marlin — from a decode-shape harness is a real project, not a tweak.
+
+**Honest standing:** we did not widen the lead. The repo remains: fp16 lossless
+at parity with vLLM, W4A16 at 1.19× (4-bit caveat). The Marlin path is real but
+its full form is out of reach without the pipelining machinery above and `ncu`.
+
 ## Reproduction
 
 ```bash

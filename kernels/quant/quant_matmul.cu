@@ -651,6 +651,130 @@ int w4a16_n_splits(int M, int N, int K, int group_size) {
     return n;
 }
 
+// ============================================================================
+// v5 Marlin-style: dequant int4 weights directly into mma.sync registers — no
+// fp16 weight staging in shared memory (Phase 11).
+//
+// ⚠ EXPLORED, NOT ON THE ACTIVE PATH. This is correct (24 quant tests pass, mma
+// layout verified against a reference tile) but MEASURED SLOWER than the wmma
+// split-K kernel above at M=16: 200-256 GB/s vs 293-386. The hypothesis — that
+// the wmma version was bottlenecked by its ~8× shmem write/read amplification —
+// was wrong: forcing max shmem carveout didn't help (not occupancy-bound), and
+// removing the weight shmem here didn't either. The register-dequant win is
+// eaten by per-K-tile ALU (nibble unpack + half2 packs + act half→float) and by
+// issuing many small m16n8k16 MMAs (one 8-wide N-tile per warp). A *competitive*
+// Marlin needs cp.async double-buffering of the weight stream, ldmatrix for the
+// activation, and larger warp tiles — a much larger build with no guarantee of
+// beating the simpler wmma kernel for this decode-shape M=16. The binding routes
+// to launch_w4a16_gemm_splitk (wmma); this is kept as a reference artifact and
+// the honest negative result. See docs/07-w4a16-e2e-journey.md.
+//
+// Mechanism: each thread loads the two packed words holding its mma B-fragment
+// lanes, unpacks + scales them straight into registers, and issues
+// mma.sync.m16n8k16. Only the activation tile is staged (reused across all N).
+namespace {
+constexpr int MMA_WARPS       = 4;
+constexpr int MMA_N_PER_WARP  = 8;                       // one m16n8k16 N-tile/warp
+constexpr int MMA_BLOCK_N     = MMA_WARPS * MMA_N_PER_WARP;   // 32
+
+__device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
+    const half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+__device__ __forceinline__ int nib(unsigned w, int p) {   // signed 4-bit at pos p
+    return (static_cast<int>(w) << (28 - 4 * p)) >> 28;
+}
+}  // namespace
+
+__global__ void w4a16_gemm_mma_splitk_kernel(
+    const half* __restrict__ act, const uint32_t* __restrict__ wp,
+    const half* __restrict__ scales, float* __restrict__ acc,
+    int M, int N, int K, int group_size, int n_splits) {
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int gid  = lane >> 2;                 // 0..7
+    const int tid  = lane & 3;                  // 0..3
+    const int warp_n0 = blockIdx.x * MMA_BLOCK_N + warp * MMA_N_PER_WARP;
+    const int n_col   = warp_n0 + gid;          // column this thread supplies B for
+    const bool ncol_ok = n_col < N;
+
+    const int n_groups = K / group_size;
+    const int gp = (n_groups + n_splits - 1) / n_splits;
+    const int g0 = blockIdx.y * gp;
+    const int g1 = min(g0 + gp, n_groups);
+    if (g0 >= n_groups) return;
+
+    extern __shared__ half act_smem[];          // [16, group_size]
+    constexpr int THREADS = MMA_WARPS * 32;
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+
+    for (int g = g0; g < g1; ++g) {
+        const int k_start = g * group_size;
+        for (int i = threadIdx.x; i < 16 * group_size; i += THREADS) {
+            const int m = i / group_size, kk = i % group_size;
+            act_smem[i] = (m < M) ? act[m * K + k_start + kk] : __float2half(0.f);
+        }
+        const float sc = ncol_ok ? __half2float(scales[g * N + n_col]) : 0.f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int kt = 0; kt < group_size / 16; ++kt) {
+            const int ko = kt * 16;             // local k offset within the group
+            const half* ar0 = act_smem + gid * group_size + ko;
+            const half* ar8 = act_smem + (gid + 8) * group_size + ko;
+            const unsigned a0 = pack_h2(__half2float(ar0[2*tid]),   __half2float(ar0[2*tid+1]));
+            const unsigned a1 = pack_h2(__half2float(ar8[2*tid]),   __half2float(ar8[2*tid+1]));
+            const unsigned a2 = pack_h2(__half2float(ar0[2*tid+8]), __half2float(ar0[2*tid+9]));
+            const unsigned a3 = pack_h2(__half2float(ar8[2*tid+8]), __half2float(ar8[2*tid+9]));
+
+            const int kg = k_start + ko;        // global k of this 16-wide tile
+            const unsigned wlo = ncol_ok ? wp[(kg / 8)     * N + n_col] : 0u;
+            const unsigned whi = ncol_ok ? wp[(kg / 8 + 1) * N + n_col] : 0u;
+            const unsigned b0 = pack_h2(nib(wlo, 2*tid) * sc, nib(wlo, 2*tid+1) * sc);
+            const unsigned b1 = pack_h2(nib(whi, 2*tid) * sc, nib(whi, 2*tid+1) * sc);
+
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+        __syncthreads();                        // before next group overwrites act_smem
+    }
+
+    // C fragment: c0,c1 -> (m=gid,   n=warp_n0+2tid, +1); c2,c3 -> (m=gid+8, ...).
+    const int nA = warp_n0 + 2 * tid, nB = nA + 1;
+    if (gid < M) {
+        if (nA < N) atomicAdd(&acc[gid * N + nA], c0);
+        if (nB < N) atomicAdd(&acc[gid * N + nB], c1);
+    }
+    if (gid + 8 < M) {
+        if (nA < N) atomicAdd(&acc[(gid + 8) * N + nA], c2);
+        if (nB < N) atomicAdd(&acc[(gid + 8) * N + nB], c3);
+    }
+}
+
+void launch_w4a16_gemm_mma_splitk(
+    const half* act, const uint32_t* weight_packed, const half* scales,
+    float* acc, half* out, int M, int N, int K, int group_size,
+    int n_splits, cudaStream_t stream) {
+
+    CUDA_CHECK(cudaMemsetAsync(acc, 0, static_cast<size_t>(M) * N * sizeof(float), stream));
+
+    dim3 grid((N + MMA_BLOCK_N - 1) / MMA_BLOCK_N, n_splits);
+    const size_t smem = static_cast<size_t>(16) * group_size * sizeof(half);
+    w4a16_gemm_mma_splitk_kernel<<<grid, MMA_WARPS * 32, smem, stream>>>(
+        act, weight_packed, scales, acc, M, N, K, group_size, n_splits);
+    CUDA_CHECK_LAST();
+
+    const int total = M * N, threads = 256;
+    w4a16_acc_to_out_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+        acc, out, total);
+    CUDA_CHECK_LAST();
+}
+
 void launch_w4a16_gemm_splitk(
     const half* act, const uint32_t* weight_packed, const half* scales,
     float* acc, half* out, int M, int N, int K, int group_size,

@@ -43,6 +43,14 @@ void launch_w4a16_gemm_splitk(
     float* acc, half* out, int M, int N, int K, int group_size,
     int n_splits, cudaStream_t stream);
 
+// Marlin-style batched W4A16 (Phase 11): dequant int4 straight into mma.sync
+// registers, no fp16 weight staging in shared memory. Same [M,N] fp32 acc
+// scratch as launch_w4a16_gemm_splitk. Preferred for 2 <= M <= 16.
+void launch_w4a16_gemm_mma_splitk(
+    const half* act, const uint32_t* weight_packed, const half* scales,
+    float* acc, half* out, int M, int N, int K, int group_size,
+    int n_splits, cudaStream_t stream);
+
 
 // Materialize the full fp16 weight [K, N] from packed int4 + groupwise scales in
 // one pass — for the prefill path, where cuBLAS on the dequantized weight beats
