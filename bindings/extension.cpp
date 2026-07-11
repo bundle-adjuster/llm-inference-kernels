@@ -9,9 +9,14 @@
 #include "quant/quant_matmul.cuh"
 
 
-// Fused decode attention with fp16 KV (current Phase 1 v3 kernel).
+// Fused decode attention with fp16 KV.
 // Inputs: q [b, n_heads, d], k/v [b, n_kv_heads, s, d], all fp16, contiguous.
 // Returns: out [b, n_heads, d] fp16. softmax_scale is typically 1/sqrt(d).
+//
+// Dispatches to the v6 FlashDecoding split-K kernel (fixes v3's occupancy wall,
+// Phase 7) whenever splitting helps; falls back to the v3 single-block kernel
+// when the sequence is too short to split usefully. The old v3 kernel is still
+// reachable directly as `decode_attention_v3` for before/after benchmarking.
 torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
                                torch::Tensor v, double softmax_scale) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
@@ -22,6 +27,60 @@ torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k,
 
     // q: [batch, n_heads, head_dim]
     // k/v: [batch, n_kv_heads, seqlen_kv, head_dim]
+    const int batch      = q.size(0);
+    const int n_heads    = q.size(1);
+    const int head_dim   = q.size(2);
+    const int n_kv_heads = k.size(1);
+    const int seqlen_kv  = k.size(2);
+
+    auto out = torch::empty_like(q);
+
+    const int n_splits = decode_attention_n_splits(batch, n_heads, seqlen_kv);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (n_splits <= 1) {
+        launch_decode_attention(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            batch, n_heads, n_kv_heads, seqlen_kv, head_dim,
+            static_cast<float>(softmax_scale), stream);
+        return out;
+    }
+
+    // Split-K scratch (fp32). torch's caching allocator makes the per-call
+    // allocation effectively free after warmup.
+    auto f32 = q.options().dtype(torch::kFloat32);
+    auto partial_o = torch::empty({batch, n_heads, n_splits, head_dim}, f32);
+    auto partial_m = torch::empty({batch, n_heads, n_splits}, f32);
+    auto partial_l = torch::empty({batch, n_heads, n_splits}, f32);
+
+    launch_decode_attention_splitk(
+        reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),
+        partial_l.data_ptr<float>(),
+        batch, n_heads, n_kv_heads, seqlen_kv, head_dim,
+        n_splits, static_cast<float>(softmax_scale), stream);
+
+    return out;
+}
+
+
+// The Phase 1 v3 kernel, exposed directly. Single-warp block per (batch, head)
+// streaming the whole KV sequence — kept for reproducing the pre-Phase-7
+// baseline and measuring the v3 -> v6 split-K speedup. Prefer decode_attention.
+torch::Tensor decode_attention_v3(torch::Tensor q, torch::Tensor k,
+                                  torch::Tensor v, double softmax_scale) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+                "q, k, v must be CUDA tensors");
+    TORCH_CHECK(q.scalar_type() == torch::kHalf, "fp16 only for now");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                "inputs must be contiguous");
+
     const int batch      = q.size(0);
     const int n_heads    = q.size(1);
     const int head_dim   = q.size(2);
@@ -291,7 +350,9 @@ torch::Tensor w4a16_gemm(torch::Tensor act,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_attention", &decode_attention,
-          "Fused decode attention (fp16 KV, custom CUDA kernel)");
+          "Fused decode attention (fp16 KV; v6 FlashDecoding split-K, v3 fallback)");
+    m.def("decode_attention_v3", &decode_attention_v3,
+          "Phase 1 v3 decode attention (single-warp block); pre-Phase-7 baseline");
     m.def("quantize_per_token", &quantize_per_token,
           "INT8 per-token symmetric quantization for KV-cache");
     m.def("decode_attention_int8", &decode_attention_int8,

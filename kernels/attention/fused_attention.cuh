@@ -20,6 +20,24 @@ void launch_decode_attention(
     float softmax_scale, cudaStream_t stream);
 
 
+// Decode attention — v6, FlashDecoding split-K. Splits each (batch, head)'s KV
+// sequence into `n_splits` chunks processed by independent blocks, then merges
+// the partial online-softmax states. Fixes v3's occupancy wall (see
+// kernels/attention/fused_attention_splitk.cu and
+// docs/05-baseline-correction-journey.md).
+//
+// Scratch (caller-allocated, fp32): partial_o [batch, n_heads, n_splits,
+// head_dim], partial_m / partial_l [batch, n_heads, n_splits]. Use
+// decode_attention_n_splits() to size them.
+int decode_attention_n_splits(int batch, int n_heads, int seqlen_kv);
+
+void launch_decode_attention_splitk(
+    const half* q, const half* k, const half* v, half* out,
+    float* partial_o, float* partial_m, float* partial_l,
+    int batch, int n_heads, int n_kv_heads, int seqlen_kv, int head_dim,
+    int n_splits, float softmax_scale, cudaStream_t stream);
+
+
 // Variant of the decode kernel reading INT8 K/V with per-token fp16 scales,
 // fusing dequantization into the inner loop. See docs/02-kv-cache-compression.md.
 //
